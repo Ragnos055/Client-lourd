@@ -15,7 +15,7 @@ class DecentralisGUI:
 
         # Tracker inputs
         ttk.Label(frm, text="Tracker IP:").grid(row=0, column=0, sticky='e')
-        self.srv_ip = tk.StringVar(value="127.0.0.1")
+        self.srv_ip = tk.StringVar(value="10.0.0.30")
         ttk.Entry(frm, textvariable=self.srv_ip, width=18).grid(row=0, column=1, sticky='w')
 
         ttk.Label(frm, text="Tracker Port:").grid(row=0, column=2, sticky='e')
@@ -23,11 +23,11 @@ class DecentralisGUI:
         ttk.Entry(frm, textvariable=self.srv_port, width=8).grid(row=0, column=3, sticky='w')
 
         # Peer inputs
-        ttk.Label(frm, text="Peer IP:").grid(row=1, column=0, sticky='e')
+        ttk.Label(frm, text="Pair IP:").grid(row=1, column=0, sticky='e')
         self.peer_ip = tk.StringVar(value="127.0.0.1")
         ttk.Entry(frm, textvariable=self.peer_ip, width=18).grid(row=1, column=1, sticky='w')
 
-        ttk.Label(frm, text="Peer Port:").grid(row=1, column=2, sticky='e')
+        ttk.Label(frm, text="Pair Port:").grid(row=1, column=2, sticky='e')
         self.peer_port = tk.IntVar(value=6000)
         ttk.Entry(frm, textvariable=self.peer_port, width=8).grid(row=1, column=3, sticky='w')
 
@@ -36,7 +36,7 @@ class DecentralisGUI:
         self.keepalive = tk.IntVar(value=15)
         ttk.Entry(frm, textvariable=self.keepalive, width=8).grid(row=2, column=1, sticky='w')
 
-        self.connect_btn = ttk.Button(frm, text="Connect", command=self._on_connect_click)
+        self.connect_btn = ttk.Button(frm, text="Connexion", command=self._on_connect_click)
         self.connect_btn.grid(row=2, column=2, columnspan=2)
 
         ttk.Label(frm, text="Pairs connus:").grid(row=3, column=0, sticky='w', pady=(10, 0))
@@ -78,7 +78,7 @@ class DecentralisGUI:
             messagebox.showerror("Erreur", str(e))
             return
 
-        self.connect_btn.config(text="Disconnect")
+        self.connect_btn.config(text="Déconnexion")
         self.connect_btn.config(command=self._on_connect_click)
         self._updating = True
         # démarrer boucle d'actualisation
@@ -97,7 +97,7 @@ class DecentralisGUI:
         finally:
             self._updating = False
             self.listbox.delete(0, tk.END)
-            self.connect_btn.config(text="Connect")
+            self.connect_btn.config(text="Connexion")
 
     def _update_peers(self):
         if not self._updating:
@@ -105,7 +105,7 @@ class DecentralisGUI:
         try:
             if self.conn:
                 resp = self.conn.get_peers()
-                peers = resp.get('peers', []) if isinstance(resp, dict) else []
+                peers = resp.get('pairs', []) if isinstance(resp, dict) else []
             else:
                 peers = []
 
@@ -120,7 +120,7 @@ class DecentralisGUI:
                     self.listbox.insert(tk.END, str(p))
         except Exception as e:
             # ne pas spammer l'utilisateur, on log seulement
-            print("Erreur récupération peers:", e)
+            print("Erreur récupération pairs:", e)
         finally:
             # relancer après 2s
             self.root.after(2000, self._update_peers)
