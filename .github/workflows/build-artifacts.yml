@@ -83,8 +83,11 @@ jobs:
           mkdir -p ${APPDIR}/usr/share/applications
           mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
           cp dist/${NAME} ${APPDIR}/usr/bin/${NAME}
-          printf '%s\n' "[Desktop Entry]" "Name=Decentralis Client" "Exec=${NAME}" "Type=Application" "Categories=Network;" "Terminal=false" > ${APPDIR}/usr/share/applications/${NAME}.desktop
+          printf '%s\n' "[Desktop Entry]" "Name=Decentralis Client" "Exec=${NAME}" "Icon=${NAME}" "Type=Application" "Categories=Network;" "Terminal=false" > ${APPDIR}/usr/share/applications/${NAME}.desktop
           chmod 644 ${APPDIR}/usr/share/applications/${NAME}.desktop
+          # appimagetool expects a .desktop at the root of AppDir as well
+          cp ${APPDIR}/usr/share/applications/${NAME}.desktop ${APPDIR}/${NAME}.desktop
+          chmod 644 ${APPDIR}/${NAME}.desktop
 
       - name: Download appimagetool
         run: |
