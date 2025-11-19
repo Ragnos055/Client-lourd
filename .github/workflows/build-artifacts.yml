@@ -105,6 +105,21 @@ jobs:
             chmod +x $TOOL
           fi
 
+      - name: Ensure icon in AppDir
+        run: |
+          APPDIR=${NAME}.AppDir
+          mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
+          # If repo contains an icon, copy it. Otherwise create a tiny placeholder PNG.
+          if [ -f assets/icon.png ]; then
+            cp assets/icon.png ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
+            cp assets/icon.png ${APPDIR}/${NAME}.png
+          else
+            echo "No assets/icon.png found — creating placeholder icon"
+            # 1x1 transparent PNG base64
+            echo iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII= | base64 -d > ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
+            cp ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png ${APPDIR}/${NAME}.png
+          fi
+
       - name: Create AppImage
         run: |
           # Use --appimage-extract-and-run to avoid requiring FUSE on the runner
