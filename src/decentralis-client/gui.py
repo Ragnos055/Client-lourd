@@ -105,7 +105,7 @@ class DecentralisGUI:
         try:
             if self.conn:
                 resp = self.conn.get_peers()
-                peers = resp.get('pairs', []) if isinstance(resp, dict) else []
+                peers = resp.get('peers', []) if isinstance(resp, dict) else []
             else:
                 peers = []
 
