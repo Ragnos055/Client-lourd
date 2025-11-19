@@ -83,14 +83,13 @@ jobs:
           mkdir -p ${APPDIR}/usr/share/applications
           mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
           cp dist/${NAME} ${APPDIR}/usr/bin/${NAME}
-          cat > ${APPDIR}/usr/share/applications/${NAME}.desktop <<EOF
-[Desktop Entry]
-Name=Decentralis Client
-Exec=${NAME}
-Type=Application
-Categories=Network;
-Terminal=false
-EOF
+          printf '%s
+'"[Desktop Entry]"'%s
+'"Name=Decentralis Client"'%s
+'"Exec=${NAME}"'%s
+'"Type=Application"'%s
+'"Categories=Network;"'%s
+'"Terminal=false"' > ${APPDIR}/usr/share/applications/${NAME}.desktop
 
       - name: Download appimagetool
         run: |
