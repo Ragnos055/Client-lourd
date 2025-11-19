@@ -1,0 +1,113 @@
+name: Build Artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows .exe
+    runs-on: windows-latest
+    env:
+      NAME: decentralis-client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name ${{ env.NAME }} src/decentralis-client/main.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: decentralis-client-windows
+          path: dist/decentralis-client.exe
+
+  build-linux:
+    name: Build Linux AppImage
+    runs-on: ubuntu-latest
+    env:
+      NAME: decentralis-client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --name ${NAME} src/decentralis-client/main.py
+
+      - name: Prepare AppDir
+        run: |
+          set -e
+          APPDIR=${NAME}.AppDir
+          rm -rf ${APPDIR}
+          mkdir -p ${APPDIR}/usr/bin
+          mkdir -p ${APPDIR}/usr/share/applications
+          mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
+          cp dist/${NAME} ${APPDIR}/usr/bin/${NAME}
+          cat > ${APPDIR}/usr/share/applications/${NAME}.desktop <<EOF
+[Desktop Entry]
+Name=Decentralis Client
+Exec=${NAME}
+Type=Application
+Categories=Network;
+Terminal=false
+EOF
+
+      - name: Download appimagetool
+        run: |
+          TOOL=appimagetool-x86_64.AppImage
+          if [ ! -f "$TOOL" ]; then
+            wget -q -O $TOOL "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+            chmod +x $TOOL
+          fi
+
+      - name: Create AppImage
+        run: |
+          ./appimagetool-x86_64.AppImage ${NAME}.AppDir dist/${NAME}.AppImage
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: decentralis-client-linux
+          path: |
+            dist/decentralis-client
+            dist/decentralis-client.AppImage
