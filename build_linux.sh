@@ -28,6 +28,7 @@ mkdir -p ${APPDIR}/usr/bin
 mkdir -p ${APPDIR}/usr/share/applications
 mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
 
+cp assets/icon.png ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
 cp ${OUTDIR}/${NAME} ${APPDIR}/usr/bin/${NAME}
 
 # Create a .desktop entry

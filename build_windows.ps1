@@ -19,7 +19,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 Write-Host "Running PyInstaller..."
-pyinstaller --onefile --windowed --name $Name --distpath $OutDir $Entry
+pyinstaller --onefile --windowed --name $Name --icon .\assets\icon.ico --distpath $OutDir $Entry
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build réussi. Fichier généré dans: $OutDir\$Name.exe"
