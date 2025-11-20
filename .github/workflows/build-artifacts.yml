@@ -1,0 +1,187 @@
+name: Build Artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows .exe
+    runs-on: windows-latest
+    env:
+      NAME: decentralis-client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name ${{ env.NAME }} src/decentralis-client/main.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: decentralis-client-windows
+          path: dist/decentralis-client.exe
+
+  build-linux:
+    name: Build Linux AppImage
+    runs-on: ubuntu-latest
+    env:
+      NAME: decentralis-client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --name ${NAME} src/decentralis-client/main.py
+
+      - name: Prepare AppDir
+        run: |
+          set -e
+          APPDIR=${NAME}.AppDir
+          rm -rf ${APPDIR}
+          mkdir -p ${APPDIR}/usr/bin
+          mkdir -p ${APPDIR}/usr/share/applications
+          mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
+          cp dist/${NAME} ${APPDIR}/usr/bin/${NAME}
+          printf '%s\n' "[Desktop Entry]" "Name=Decentralis Client" "Icon=${NAME}" "Exec=${NAME}" "Type=Application" "Categories=Network;" "Terminal=false" > ${APPDIR}/usr/share/applications/${NAME}.desktop
+          chmod 644 ${APPDIR}/usr/share/applications/${NAME}.desktop
+          # appimagetool expects a .desktop at the root of AppDir as well
+          cp ${APPDIR}/usr/share/applications/${NAME}.desktop ${APPDIR}/${NAME}.desktop
+          chmod 644 ${APPDIR}/${NAME}.desktop
+
+      - name: Add icon to AppDir
+        run: |
+          if [ -f assets/icon.png ]; then
+            cp assets/icon.png ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
+          else
+            echo "No assets/icon.png found; skipping icon copy"
+          fi
+
+      - name: Download appimagetool
+        run: |
+          TOOL=appimagetool-x86_64.AppImage
+          if [ ! -f "$TOOL" ]; then
+            wget -q -O $TOOL "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+            chmod +x $TOOL
+          fi
+
+      - name: Ensure icon in AppDir
+        run: |
+          APPDIR=${NAME}.AppDir
+          mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
+          # If repo contains an icon, copy it. Otherwise create a tiny placeholder PNG.
+          if [ -f assets/icon.png ]; then
+            cp assets/icon.png ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
+            cp assets/icon.png ${APPDIR}/${NAME}.png
+          else
+            echo "No assets/icon.png found — creating placeholder icon"
+            # 1x1 transparent PNG base64
+            echo iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII= | base64 -d > ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png
+            cp ${APPDIR}/usr/share/icons/hicolor/256x256/apps/${NAME}.png ${APPDIR}/${NAME}.png
+          fi
+
+      - name: Create AppImage
+        run: |
+          # Use --appimage-extract-and-run to avoid requiring FUSE on the runner
+          ./appimagetool-x86_64.AppImage --appimage-extract-and-run ${NAME}.AppDir dist/${NAME}.AppImage
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: decentralis-client-linux
+          path: |
+            dist/decentralis-client
+            dist/decentralis-client.AppImage
+
+  publish-release:
+    name: Publish Release Assets
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: decentralis-client-windows
+          path: artifacts/windows
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: decentralis-client-linux
+          path: artifacts/linux
+
+      - name: List downloaded files
+        run: |
+          echo "Files in artifacts/windows:"
+          ls -R artifacts/windows || true
+          echo "Files in artifacts/linux:"
+          ls -R artifacts/linux || true
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${REPO}/releases"
+          echo "Creating release for tag ${TAG}..."
+          resp=$(curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"Automated release from CI\",\"draft\":false,\"prerelease\":false}" ${API})
+          upload_url=$(echo "$resp" | jq -r .upload_url | sed -e 's/{?name,label}//')
+          if [ "$upload_url" = "null" ] || [ -z "$upload_url" ]; then
+            echo "Failed to create release or retrieve upload_url:"
+            echo "$resp"
+            exit 1
+          fi
+          echo "Upload URL: $upload_url"
+
+          # upload all files under artifacts/
+          for f in $(find artifacts -type f); do
+            echo "Uploading $f..."
+            filename=$(basename "$f")
+            curl --silent --show-error -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/octet-stream" --data-binary @"$f" "${upload_url}?name=${filename}"
+          done

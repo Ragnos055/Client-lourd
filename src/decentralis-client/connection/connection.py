@@ -15,21 +15,26 @@ class connection:
         self.peer_port = peer_port
         self.keepalive_interval = keepalive_interval
 
+        # Effectue une annonce initiale et récupère les pairs,
+        # puis démarre la boucle périodique dans un thread daemon.
+        # Ne bloque plus le thread appelant (utile pour une interface graphique).
+        self.announce()
+        self.get_peers()
+        self._thread = threading.Thread(target=self.periodic_announce, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        """Arrête proprement la boucle périodique.
+
+        Note: `stop_event` est global dans ce module, donc cela arrête
+        la boucle périodique côté module.
+        """
+        stop_event.set()
         try:
-            self.announce()
-            self.get_peers()
-
-            threading.Thread(target=self.periodic_announce, daemon=True).start()
-
-            print("Client en cours d'exécution. Appuyez sur Ctrl+C pour quitter.")
-            while True:
-                pass
-                # time.sleep(30)
-                # get_peers()
-        except KeyboardInterrupt:
-            print("\nArrêt du client demandé, fermeture...")
-        finally:
-            stop_event.set()
+            if hasattr(self, '_thread') and self._thread.is_alive():
+                self._thread.join(timeout=1)
+        except Exception:
+            pass
 
     def send_request(self, payload):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
