@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
 import secrets
 import os
@@ -63,23 +63,36 @@ class DecentralisGUI:
         # Frames for each view (now provided by separate modules)
         self.frames = {}
         # storage directory for files (per-user storage)
-        self.storage_dir = os.path.join(os.path.expanduser('~'), '.decentralis', 'storage')
+        self.config_dir = os.path.join(os.path.expanduser('~'), '.decentralis')
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.storage_dir = os.path.join(self.config_dir, 'storage')
         os.makedirs(self.storage_dir, exist_ok=True)
+        # retention (key) file path
+        self.retention_path = os.path.join(self.config_dir, 'key.json')
+
         self.frames['peers'] = PeersView(container, self)
         self.frames['peers'].grid(row=0, column=0, sticky='nsew')
-
-        self.frames['files'] = FilesView(container, self)
-        self.frames['files'].grid(row=0, column=0, sticky='nsew')
 
         self.frames['encryption'] = EncryptionView(container, self)
         self.frames['encryption'].grid(row=0, column=0, sticky='nsew')
 
-        self.show_view('peers')
+        # If a retention file already exists, prompt for passphrase now so it's cached
+        # before views are used. If no retention file exists, we'll create frames first
+        # and then force creation/import via _ensure_retention_file below.
+        try:
+            self._ensure_retention_file()
+        except Exception as e:
+            messagebox.showerror('Erreur', f'Erreur initialisation clé: {e}')
+
+        self.frames['files'] = FilesView(container, self)
+        self.frames['files'].grid(row=0, column=0, sticky='nsew')
+
+
+        self.show_view('files')
 
         # connection state
         self.conn = None
         self._updating = False
-        self.encryption_settings = {}
 
     # --- Views creation ---
     # view creation is now delegated to separate view classes in files under views/
@@ -160,6 +173,46 @@ class DecentralisGUI:
             print("Erreur récupération pairs:", e)
         finally:
             self.root.after(2000, self._update_peers)
+    
+    def _ensure_retention_file(self):
+        """Ensure a retention JSON exists; if yes prompt for passphrase; if not force create/import."""
+        from keyring import verify_passphrase_and_get_keyhex, load_retention
+
+        if os.path.exists(self.retention_path):
+            # ask for passphrase and derive key
+            for _ in range(3):
+                p = simpledialog.askstring('Passphrase', 'Entrez la passphrase pour la clé de rétention:', show='*')
+                if p is None:
+                    # user cancelled
+                    break
+                try:
+                    keyhex = verify_passphrase_and_get_keyhex(self.retention_path, p)
+                    data = load_retention(self.retention_path)
+                    self.encryption_settings = {'algorithm': data.get('algorithm', 'AES-256'), 'key': keyhex}
+                    # cache passphrase for this session
+                    self._cached_passphrase = p
+                    return True
+                except Exception as e:
+                    messagebox.showerror('Erreur', f'Passphrase incorrecte: {e}')
+            raise RuntimeError('Passphrase non fournie ou incorrecte')
+        else:
+            # force create or import
+            ans = messagebox.askyesno('Clé manquante', 'Aucun fichier de rétention trouvé. Voulez-vous en créer un maintenant ? (Oui = créer, Non = importer)')
+            if ans:
+                # create using Encryption view helper
+                self.show_view('encryption')
+                try:
+                    self.frames['encryption'].create_retention()
+                except Exception as e:
+                    raise
+            else:
+                self.show_view('encryption')
+                try:
+                    self.frames['encryption'].import_retention()
+                except Exception as e:
+                    raise
+            # after create/import, recall to prompt passphrase
+            return self._ensure_retention_file()
     # File manager and encryption actions are implemented inside their respective view classes
 
 
