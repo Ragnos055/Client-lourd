@@ -69,6 +69,9 @@ class DecentralisGUI:
         os.makedirs(self.storage_dir, exist_ok=True)
         # retention (key) file path
         self.retention_path = os.path.join(self.config_dir, 'key.json')
+        # encryption settings object (cached for the session)
+        self.encryption_settings = {}
+        self._cached_passphrase = None
 
         self.frames['peers'] = PeersView(container, self)
         self.frames['peers'].grid(row=0, column=0, sticky='nsew')
@@ -176,7 +179,7 @@ class DecentralisGUI:
     
     def _ensure_retention_file(self):
         """Ensure a retention JSON exists; if yes prompt for passphrase; if not force create/import."""
-        from keyring import verify_passphrase_and_get_keyhex, load_retention
+        from keystore import verify_passphrase_and_get_keyhex, load_retention
 
         if os.path.exists(self.retention_path):
             # ask for passphrase and derive key

@@ -4,7 +4,7 @@ import secrets
 import os
 import shutil
 
-import keyring
+import keystore
 
 
 class EncryptionView(ttk.Frame):
@@ -84,7 +84,7 @@ class EncryptionView(ttk.Frame):
 
         path = os.path.join(self.app_gui.config_dir, 'key.json')
         try:
-            keyring.generate_retention_file(path, p1, iterations=200000, algorithm=self.algo_var.get())
+            keystore.generate_retention_file(path, p1, iterations=200000, algorithm=self.algo_var.get())
             messagebox.showinfo('Succès', f'Fichier de rétention créé: {path}')
         except Exception as e:
             messagebox.showerror('Erreur', f'Echec création: {e}')
@@ -109,7 +109,7 @@ class EncryptionView(ttk.Frame):
         if not dst:
             return
         try:
-            keyring.export_retention(src, dst)
+            keystore.export_retention(src, dst)
             messagebox.showinfo('Succès', f'Fichier exporté: {dst}')
         except Exception as e:
             messagebox.showerror('Erreur', f'Echec export: {e}')
@@ -125,8 +125,8 @@ class EncryptionView(ttk.Frame):
             messagebox.showerror('Erreur', 'Aucun fichier de rétention trouvé, créez ou importez-en un first')
             return
         try:
-            keyhex = keyring.verify_passphrase_and_get_keyhex(path, p)
-            data = keyring.load_retention(path)
+            keyhex = keystore.verify_passphrase_and_get_keyhex(path, p)
+            data = keystore.load_retention(path)
             self.app_gui.encryption_settings = {'algorithm': data.get('algorithm', 'AES-256'), 'key': keyhex}
             # cache passphrase
             self.app_gui._cached_passphrase = p
