@@ -7,6 +7,8 @@ import base64
 import tempfile
 
 import crypto
+import p2p
+import rs_codec
 
 
 class FilesView(ttk.Frame):
@@ -181,20 +183,106 @@ class FilesView(ttk.Frame):
             messagebox.showerror('Erreur', 'Paramètres de chiffrement non configurés. Configurez une clé dans la vue Chiffrement.')
             return
 
+        # require active connection to tracker / peers
+        conn = getattr(self.app_gui, 'conn', None)
+        if not conn:
+            messagebox.showerror('Erreur', 'Pas de connexion au tracker/pairs. Connectez-vous avant de téléverser.')
+            return
+
         try:
+            # récupérer la liste des pairs depuis le tracker
+            resp = conn.get_peers()
+            peers = resp.get('peers', []) if isinstance(resp, dict) else []
+            # filtrer self
+            filtered = []
+            for pinfo in peers:
+                if not isinstance(pinfo, dict):
+                    continue
+                ip = pinfo.get('ip')
+                port = pinfo.get('port')
+                if ip is None or port is None:
+                    continue
+                try:
+                    if ip == conn.peer_ip and int(port) == int(conn.peer_port):
+                        continue
+                except Exception:
+                    pass
+                filtered.append({'ip': ip, 'port': int(port)})
+
+            if not filtered:
+                messagebox.showinfo('Info', 'Aucun pair disponible pour recevoir le fichier.')
+                return
+
+            # Chargement du fichier source en mémoire pour segmentation RS
             with open(path, 'rb') as f:
                 data = f.read()
-            b64 = base64.b64encode(data).decode('ascii')
-            name = os.path.basename(path)
-            keypath = os.path.join(self.cwd, name) if self.cwd else name
-            keypath = keypath.replace('\\', '/')
-            entries = self.container.setdefault('entries', {})
-            entries[keypath] = {'type': 'file', 'content': b64}
-            if self.save_container():
-                messagebox.showinfo('Upload', 'Fichier ajouté au conteneur chiffré')
-                self.refresh()
+
+            total_shards = len(filtered)
+            if total_shards < 2:
+                # avec un seul pair, RS n'apporte rien : on chiffre et envoie comme avant
+                pinfo = filtered[0]
+                p2p.send_encrypted_file(pinfo['ip'], pinfo['port'], path, algo=algo, key_hex=key)
+                messagebox.showinfo('Upload', 'Fichier chiffré envoyé au seul pair disponible (sans Reed-Solomon).')
+                return
+
+            # Choix simple: on garde  total_shards-1  shards de données et 1 shard de parité
+            data_shards = total_shards - 1
+            try:
+                shards, pad_len = rs_codec.encode_to_shards(data, data_shards=data_shards, total_shards=total_shards)
+            except Exception as e:
+                messagebox.showerror('Erreur', f'Echec encodage Reed-Solomon: {e}')
+                return
+
+            file_id = secrets.token_hex(16)
+            sent = 0
+            errors = 0
+
+            for idx, pinfo in enumerate(filtered):
+                shard_bytes = shards[idx]
+                # écrire shard dans un fichier temporaire, le chiffrer, puis l'envoyer
+                fd_plain, tmp_plain = tempfile.mkstemp(prefix='rs_shard_', suffix='.bin')
+                os.close(fd_plain)
+                try:
+                    with open(tmp_plain, 'wb') as f:
+                        f.write(shard_bytes)
+
+                    fd_cipher, tmp_cipher = tempfile.mkstemp(prefix='rs_cipher_', suffix='.bin')
+                    os.close(fd_cipher)
+                    try:
+                        crypto.encrypt_file(tmp_plain, tmp_cipher, key, algorithm=algo)
+                        header = {
+                            "name": secrets.token_hex(16),
+                            "algo": algo,
+                            "v": 2,
+                            "rs": {
+                                "file_id": file_id,
+                                "index": idx,
+                                "data_shards": data_shards,
+                                "total_shards": total_shards,
+                                "pad_len": pad_len,
+                            },
+                        }
+                        p2p._send_cipherfile(pinfo['ip'], pinfo['port'], tmp_cipher, header)
+                        sent += 1
+                    finally:
+                        try:
+                            os.remove(tmp_cipher)
+                        except Exception:
+                            pass
+                except Exception:
+                    errors += 1
+                finally:
+                    try:
+                        os.remove(tmp_plain)
+                    except Exception:
+                        pass
+
+            if sent > 0:
+                messagebox.showinfo('Upload', f'Fichier segmenté (Reed-Solomon) et chiffré envoyé à {sent} pair(s). Erreurs sur {errors} pair(s).')
+            else:
+                messagebox.showerror('Upload', 'Échec de l’envoi de tous les fragments.')
         except Exception as e:
-            messagebox.showerror('Erreur', f'Echec upload: {e}')
+            messagebox.showerror('Erreur', f'Echec upload vers pairs: {e}')
 
     def download_file(self):
         sel = self.listbox.curselection()
