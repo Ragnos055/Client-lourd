@@ -1,10 +1,11 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
-import secrets
 import os
-
+import secrets
+import socket
 from connection.connection import connection
+import p2p
 from views.peers_view import PeersView
 from views.files_view import FilesView
 from views.encryption_view import EncryptionView
@@ -96,6 +97,7 @@ class DecentralisGUI:
         # connection state
         self.conn = None
         self._updating = False
+        self.p2p_server = None
 
     # --- Views creation ---
     # view creation is now delegated to separate view classes in files under views/
@@ -128,6 +130,8 @@ class DecentralisGUI:
         def create_conn():
             try:
                 self.conn = connection(srv_ip, srv_port, peer_ip, peer_port, keepalive)
+                # démarrer le serveur TCP pour réception de fichiers chiffrés
+                self._start_p2p_server(peer_ip, peer_port)
             except Exception as e:
                 self.conn = None
                 self.root.after(0, lambda: messagebox.showerror("Erreur de connexion", str(e)))
@@ -149,6 +153,10 @@ class DecentralisGUI:
                 self.conn = None
         finally:
             self._updating = False
+            try:
+                self._stop_p2p_server()
+            except Exception:
+                pass
             # clear peers view listbox if present
             try:
                 if 'peers' in self.frames and hasattr(self.frames['peers'], 'listbox'):
@@ -176,6 +184,56 @@ class DecentralisGUI:
             print("Erreur récupération pairs:", e)
         finally:
             self.root.after(2000, self._update_peers)
+    
+    # --- P2P server management ---
+    def _start_p2p_server(self, host: str, port: int):
+        try:
+            self._stop_p2p_server()
+        except Exception:
+            pass
+        try:
+            # écoute sur l'adresse configurée (ou 0.0.0.0 si host vide)
+            listen_host = host or "0.0.0.0"
+            self.p2p_server = p2p.P2PServer(listen_host, port, self.storage_dir, on_file_received=self._on_file_received)
+            self.p2p_server.start()
+        except OSError as e:
+            messagebox.showerror("Erreur P2P", f"Impossible de démarrer l'écoute TCP: {e}")
+            self.p2p_server = None
+
+    def _stop_p2p_server(self):
+        if self.p2p_server:
+            try:
+                self.p2p_server.stop()
+            except Exception:
+                pass
+            self.p2p_server = None
+
+    def _on_file_received(self, path: str, sender_ip: str):
+        # notification simple en UI
+        self.root.after(0, lambda: messagebox.showinfo("Fichier reçu", f"Chiffre reçu depuis {sender_ip}\nStocké: {path}"))
+
+    # --- Sending files to peers ---
+    def send_file_to_peer(self, peer):
+        """
+        peer: dict avec ip/port.
+        """
+        if not peer:
+            messagebox.showinfo("Info", "Sélectionnez un pair.")
+            return
+        settings = getattr(self, "encryption_settings", {}) or {}
+        algo = settings.get("algorithm")
+        key = settings.get("key")
+        if not algo or not key:
+            messagebox.showerror("Erreur", "Paramètres de chiffrement manquants. Configurez une clé.")
+            return
+        path = filedialog.askopenfilename(title="Choisir le fichier à envoyer (sera chiffré et envoyé)")
+        if not path:
+            return
+        try:
+            p2p.send_encrypted_file(peer.get("ip"), int(peer.get("port")), path, algo=algo, key_hex=key)
+            messagebox.showinfo("Envoyé", "Fichier chiffré envoyé avec un nom aléatoire.")
+        except Exception as e:
+            messagebox.showerror("Erreur envoi", f"Echec envoi: {e}")
     
     def _ensure_retention_file(self):
         """Ensure a retention JSON exists; if yes prompt for passphrase; if not force create/import."""
