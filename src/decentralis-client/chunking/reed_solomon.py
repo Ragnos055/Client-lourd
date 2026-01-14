@@ -75,7 +75,7 @@ class ReedSolomonEncoder:
         4
     """
     
-    def __init__(self, k: int = 6, m: int = 4, nsym: int = 10,
+    def __init__(self, k: int = 6, m: int = 4, nsym: int = None,
                  logger: Optional[logging.Logger] = None):
         """
         Initialise l'encodeur Reed-Solomon.
@@ -83,7 +83,7 @@ class ReedSolomonEncoder:
         Args:
             k: Nombre de chunks de données (défaut: 6)
             m: Nombre de chunks de parité (défaut: 4)
-            nsym: Nombre de symboles de parité pour reedsolo (défaut: 10)
+            nsym: Nombre de symboles de parité pour reedsolo (défaut: m)
             logger: Logger optionnel
             
         Raises:
@@ -96,7 +96,7 @@ class ReedSolomonEncoder:
         """
         self.k = k
         self.m = m
-        self.nsym = nsym
+        self.nsym = nsym if nsym is not None else m  # nsym par défaut = m
         self.total_chunks = k + m
         self.logger = logger or logging.getLogger(__name__)
         
@@ -120,12 +120,12 @@ class ReedSolomonEncoder:
         # Initialiser le codec Reed-Solomon
         if REEDSOLO_AVAILABLE:
             try:
-                self.codec = RSCodec(nsym)
-                self.logger.debug(f"RSCodec initialisé avec nsym={nsym}")
+                self.codec = RSCodec(self.nsym)
+                self.logger.debug(f"RSCodec initialisé avec nsym={self.nsym}")
             except Exception as e:
                 raise ChunkEncodingError(
                     "Failed to initialize RSCodec",
-                    {"nsym": nsym, "error": str(e)}
+                    {"nsym": self.nsym, "error": str(e)}
                 )
         else:
             self.codec = None
@@ -379,14 +379,18 @@ class ReedSolomonEncoder:
             
             try:
                 # Décoder avec les positions d'effacement
-                decoded = self.codec.decode(
+                # reedsolo.decode retourne (data, ecc, errata_pos) 
+                decoded_result = self.codec.decode(
                     bytes(data_with_erasures), 
                     erase_pos=erasure_positions[:self.nsym]
                 )
                 
+                # Extraire les données décodées (premier élément du tuple)
+                decoded_data = decoded_result[0] if isinstance(decoded_result, tuple) else decoded_result
+                
                 # Extraire les bytes de données
                 for i in range(self.k):
-                    result[i * chunk_size + byte_pos] = decoded[i]
+                    result[i * chunk_size + byte_pos] = decoded_data[i]
                     
             except ReedSolomonError as e:
                 raise ChunkDecodingError(

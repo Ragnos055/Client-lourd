@@ -5,18 +5,24 @@ import shutil
 import json
 import base64
 import tempfile
+import asyncio
+import threading
+import hashlib
 
 import crypto
 
 
 class FilesView(ttk.Frame):
     CONTAINER_NAME = 'container.dat'
+    CONTAINER_FILE_UUID = 'container-dat-primary'  # UUID fixe pour le container
 
     def __init__(self, parent, app_gui, **kwargs):
         super().__init__(parent, **kwargs)
         self.app_gui = app_gui
         self.cwd = ''  # virtual path inside container ('' = root)
         self.container = {'entries': {}}  # in-memory container structure
+        self._container_hash = None  # Hash du container pour détecter les changements
+        self._auto_sync_enabled = True  # Activer/désactiver la sync automatique
 
         # toolbar
         toolbar = ttk.Frame(self)
@@ -94,6 +100,10 @@ class FilesView(ttk.Frame):
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.container, f)
             crypto.encrypt_file(tmp, path, key, algorithm=algo)
+            
+            # Déclencher le chunking automatique après sauvegarde
+            self._trigger_auto_chunk()
+            
             return True
         except Exception as e:
             messagebox.showerror('Erreur', f'Echec sauvegarde conteneur: {e}')
@@ -104,6 +114,89 @@ class FilesView(ttk.Frame):
                     os.remove(tmp)
             except Exception:
                 pass
+
+    def _trigger_auto_chunk(self):
+        """
+        Déclenche le chunking automatique du container.dat
+        et la distribution vers les pairs si connecté.
+        """
+        if not self._auto_sync_enabled:
+            return
+            
+        chunking_mgr = getattr(self.app_gui, 'chunking_mgr', None)
+        if not chunking_mgr:
+            return
+        
+        # Calculer le hash du container pour détecter les changements
+        container_path = self.container_path()
+        if not os.path.exists(container_path):
+            return
+            
+        try:
+            with open(container_path, 'rb') as f:
+                new_hash = hashlib.sha256(f.read()).hexdigest()
+        except Exception:
+            return
+        
+        # Si le hash n'a pas changé, pas besoin de re-chunker
+        if new_hash == self._container_hash:
+            return
+        
+        self._container_hash = new_hash
+        
+        # Exécuter le chunking dans un thread séparé
+        def do_chunk():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Chunker le fichier
+                owner_uuid = getattr(self.app_gui, '_peer_uuid', 'local')
+                
+                # Supprimer l'ancien chunking du container s'il existe
+                try:
+                    existing = chunking_mgr.db.get_file_metadata_by_name(
+                        self.CONTAINER_NAME, owner_uuid
+                    )
+                    if existing:
+                        loop.run_until_complete(
+                            self._delete_old_container_chunks(chunking_mgr, existing.file_uuid, owner_uuid)
+                        )
+                except Exception:
+                    pass
+                
+                # Chunker le nouveau container
+                file_uuid = loop.run_until_complete(
+                    chunking_mgr.chunk_file(container_path, owner_uuid)
+                )
+                
+                print(f"[Auto-Chunk] container.dat chunké: {file_uuid[:8]}...")
+                
+                # Distribuer si on est connecté au tracker
+                conn = getattr(self.app_gui, 'conn', None)
+                if conn:
+                    try:
+                        result = loop.run_until_complete(
+                            chunking_mgr.distribute_chunks(file_uuid, owner_uuid)
+                        )
+                        print(f"[Auto-Sync] Distribué: {result.get('distributed', 0)}/{result.get('total_chunks', 0)} chunks")
+                    except Exception as e:
+                        print(f"[Auto-Sync] Erreur distribution: {e}")
+                
+                loop.close()
+                
+            except Exception as e:
+                print(f"[Auto-Chunk] Erreur: {e}")
+        
+        thread = threading.Thread(target=do_chunk, daemon=True)
+        thread.start()
+    
+    async def _delete_old_container_chunks(self, mgr, file_uuid: str, owner_uuid: str):
+        """Supprime les anciens chunks du container."""
+        try:
+            mgr.delete_file(file_uuid, owner_uuid)
+        except Exception:
+            pass
 
     def refresh(self):
         if not self.load_container():

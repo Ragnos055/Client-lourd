@@ -20,6 +20,7 @@
 | Langage | Python 3.8+ (recommandé 3.11) |
 | Interface graphique | Tkinter (ttk) |
 | Cryptographie | `cryptography` (AESGCM, ChaCha20Poly1305, PBKDF2) |
+| Chunking P2P | `reedsolo` (Reed-Solomon), asyncio |
 | Build | PyInstaller |
 
 ---
@@ -37,18 +38,31 @@ Client-lourd/
 │       ├── connection/              # Module de connexion réseau
 │       │   ├── __init__.py
 │       │   └── connection.py        # Logique de connexion au tracker
+│       ├── chunking/                # Module de chunking P2P (NOUVEAU)
+│       │   ├── __init__.py          # Exports du module
+│       │   ├── config.py            # Configuration globale du chunking
+│       │   ├── models.py            # Modèles de données (dataclasses)
+│       │   ├── exceptions.py        # Exceptions personnalisées
+│       │   ├── reed_solomon.py      # Encodeur/décodeur Reed-Solomon + LRC
+│       │   ├── chunk_store.py       # Stockage local des chunks sur disque
+│       │   ├── chunk_db.py          # Base de données SQLite des métadonnées
+│       │   ├── chunking_mgr.py      # Orchestrateur principal du chunking
+│       │   ├── replication_mgr.py   # Gestion de la réplication/relocalisation
+│       │   ├── peer_rpc.py          # Client RPC asynchrone pour P2P
+│       │   └── chunk_net.py         # Serveur TCP pour requêtes entrantes
 │       └── views/                   # Vues de l'interface
 │           ├── __init__.py
 │           ├── peers_view.py        # Vue liste des pairs
 │           ├── files_view.py        # Vue gestionnaire de fichiers
-│           └── encryption_view.py   # Vue paramètres de chiffrement
+│           ├── encryption_view.py   # Vue paramètres de chiffrement
+│           └── p2p_view.py          # Vue réseau P2P et chunking (NOUVEAU)
 ├── assets/                          # Ressources (icônes, images)
 ├── build_windows.ps1                # Script de build Windows
 ├── build_linux.sh                   # Script de build Linux
 ├── requirements.txt                 # Dépendances Python
 ├── README.md                        # Documentation utilisateur
 ├── README_BUILD.md                  # Instructions de build
-└── ARCHITECTURE.md                  # Ce fichier
+└── ARCHITECTURE-CLIENT.md           # Ce fichier
 ```
 
 ---
@@ -67,22 +81,48 @@ Client-lourd/
                     │   gui.py     │ (DecentralisGUI)
                     └──────┬───────┘
                            │
-          ┌────────────────┼────────────────┐
-          │                │                │
-          ▼                ▼                ▼
-   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-   │ peers_view  │  │ files_view  │  │encryption_  │
-   │             │  │             │  │   view      │
-   └─────────────┘  └──────┬──────┘  └──────┬──────┘
-                           │                │
-                           ▼                ▼
-                    ┌─────────────┐  ┌─────────────┐
-                    │  crypto.py  │  │ keystore.py │
-                    └─────────────┘  └─────────────┘
+     ┌─────────────────────┼─────────────────────┐
+     │          │          │          │          │
+     ▼          ▼          ▼          ▼          ▼
+┌─────────┐┌─────────┐┌─────────┐┌─────────┐┌─────────┐
+│ peers_  ││ files_  ││encrypt- ││ p2p_    ││chunking_│
+│ view    ││ view    ││ion_view ││ view    ││ mgr     │
+└─────────┘└────┬────┘└────┬────┘└────┬────┘└────┬────┘
+                │          │          │          │
+                ▼          ▼          └────┬─────┘
+          ┌─────────┐┌─────────┐           │
+          │crypto.py││keystore │           ▼
+          └─────────┘└─────────┘    ┌────────────┐
+                                    │  chunking/ │
+                                    │  module    │
+                                    └────────────┘
 
    ┌───────────────────────────────────────────────┐
    │            connection/connection.py           │
    │         (Gestion tracker indépendante)        │
+   └───────────────────────────────────────────────┘
+
+   ┌───────────────────────────────────────────────┐
+   │              chunking/ (module P2P)           │
+   │  ┌─────────────────────────────────────────┐  │
+   │  │         chunking_mgr.py                 │  │
+   │  │       (Orchestrateur principal)         │  │
+   │  └─────────────┬───────────────────────────┘  │
+   │                │                              │
+   │    ┌───────────┼───────────┬────────────┐     │
+   │    ▼           ▼           ▼            ▼     │
+   │ ┌──────┐  ┌──────────┐  ┌──────┐  ┌────────┐  │
+   │ │reed_ │  │chunk_    │  │chunk_│  │replica-│  │
+   │ │solo- │  │store.py  │  │db.py │  │tion_   │  │
+   │ │mon.py│  │(disque)  │  │(SQL) │  │mgr.py  │  │
+   │ └──────┘  └──────────┘  └──────┘  └────────┘  │
+   │                                               │
+   │    ┌─────────────────┬──────────────────┐     │
+   │    ▼                 ▼                  │     │
+   │ ┌──────────┐   ┌──────────┐             │     │
+   │ │peer_rpc  │   │chunk_net │   ◄─────────┘     │
+   │ │(client)  │   │(serveur) │                   │
+   │ └──────────┘   └──────────┘                   │
    └───────────────────────────────────────────────┘
 ```
 
@@ -142,11 +182,16 @@ def main():
 
 | Méthode | Description |
 |---------|-------------|
-| `show_view(name)` | Affiche une vue (`peers`, `files`, `encryption`) |
+| `show_view(name)` | Affiche une vue (`peers`, `files`, `encryption`, `p2p`) |
 | `_on_connect_click()` | Connexion/Déconnexion du tracker |
 | `_disconnect()` | Ferme la connexion proprement |
 | `_update_peers()` | Mise à jour périodique des pairs (toutes les 2s) |
 | `_ensure_retention_file()` | Vérifie/crée le fichier de rétention au démarrage |
+| `_init_chunking()` | **Initialise le ChunkingManager** (NOUVEAU) |
+| `_on_close()` | **Cleanup à la fermeture (shutdown ChunkingManager)** (NOUVEAU) |
+| `_check_and_restore_container()` | **Restaure container.dat depuis chunks si absent** (NOUVEAU) |
+| `_restore_container_async()` | **Restauration asynchrone du container** (NOUVEAU) |
+| `_on_container_restored()` | **Callback après restauration réussie** (NOUVEAU) |
 
 #### Flux de démarrage
 
@@ -155,12 +200,16 @@ def main():
 2. Création du menu Vue
 3. Création du conteneur principal
 4. Initialisation des répertoires (~/.decentralis, ~/.decentralis/storage)
-5. Création de PeersView et EncryptionView
-6. _ensure_retention_file() :
+5. Génération de _peer_uuid + _init_chunking() (NOUVEAU)
+6. Création de PeersView et EncryptionView
+7. _ensure_retention_file() :
    - Si key.json existe → demande passphrase (3 tentatives max)
    - Sinon → propose création ou import
-7. Création de FilesView (nécessite encryption_settings)
-8. Affichage de la vue files par défaut
+8. Création de FilesView (nécessite encryption_settings)
+9. Création de P2PView (NOUVEAU)
+10. _check_and_restore_container() : (NOUVEAU)
+    - Si container.dat absent ET chunks en base → propose restauration
+11. Affichage de la vue files par défaut
 ```
 
 ---
@@ -319,12 +368,15 @@ def main():
 - Navigation dans le système de fichiers virtuel (conteneur chiffré)
 - Upload/Download de fichiers
 - Création/suppression de dossiers
+- **Auto-chunking du container.dat après modifications** (NOUVEAU)
+- **Synchronisation automatique des chunks vers les pairs** (NOUVEAU)
 
 #### Constantes
 
 | Constante | Valeur | Description |
 |-----------|--------|-------------|
 | `CONTAINER_NAME` | `'container.dat'` | Nom du fichier conteneur chiffré |
+| `CONTAINER_FILE_UUID` | `'container-dat-primary'` | UUID fixe pour le container (NOUVEAU) |
 
 #### Attributs
 
@@ -333,6 +385,8 @@ def main():
 | `app_gui` | `DecentralisGUI` | Référence à l'application principale |
 | `cwd` | `str` | Chemin virtuel actuel ('' = racine) |
 | `container` | `dict` | Structure en mémoire du conteneur |
+| `_container_hash` | `str` | Hash SHA256 du container pour détecter les changements (NOUVEAU) |
+| `_auto_sync_enabled` | `bool` | Active/désactive la sync automatique (NOUVEAU) |
 
 #### Structure du conteneur (JSON)
 
@@ -366,8 +420,10 @@ def main():
 |---------|-------------|
 | `container_path()` | Retourne le chemin complet du fichier conteneur |
 | `load_container()` | Déchiffre et charge le conteneur en mémoire |
-| `save_container()` | Chiffre et sauvegarde le conteneur |
+| `save_container()` | Chiffre, sauvegarde le conteneur, **puis déclenche l'auto-chunk** (MODIFIÉ) |
 | `refresh()` | Recharge et réaffiche le contenu du dossier actuel |
+| `_trigger_auto_chunk()` | **Chunke automatiquement container.dat et distribue** (NOUVEAU) |
+| `_delete_old_container_chunks()` | **Supprime les anciens chunks avant re-chunking** (NOUVEAU) |
 | `go_up()` | Remonte d'un niveau dans l'arborescence |
 | `enter_selected()` | Entre dans le dossier sélectionné |
 | `new_folder()` | Crée un nouveau dossier |
@@ -431,6 +487,73 @@ def main():
 
 ---
 
+### 9. `views/p2p_view.py` - Vue réseau P2P (NOUVEAU)
+
+**Classe**: `P2PView(ttk.Frame)`
+
+**Responsabilités**:
+- Interface utilisateur pour le chunking et la distribution P2P
+- Chunking de fichiers locaux avec Reed-Solomon
+- Distribution de chunks vers les pairs
+- Récupération de fichiers depuis le réseau P2P
+- Gestion du serveur de chunks local
+
+#### Dépendances
+
+| Module | Usage |
+|--------|-------|
+| `chunking.chunking_mgr` | Orchestrateur principal du chunking |
+| `chunking.chunk_db` | Accès aux métadonnées SQLite |
+| `asyncio` | Boucle d'événements pour opérations async |
+| `threading` | Exécution non-bloquante dans la GUI |
+
+#### Widgets
+
+| Widget | Variable | Description |
+|--------|----------|-------------|
+| LabelFrame | - | Section "Actions" |
+| Button | - | "📂 Chunker un fichier" |
+| Button | - | "🌐 Distribuer" |
+| Button | - | "📥 Récupérer du réseau" |
+| Button | - | "🔄 Rafraîchir" |
+| LabelFrame | - | Section "Serveur de chunks" |
+| Label | `server_status_var` | État du serveur (🔴/🟢) |
+| Entry | `server_port_var` | Port d'écoute (défaut: 6881) |
+| Button | - | "▶ Démarrer" / "⏹ Arrêter" |
+| LabelFrame | - | Section "Fichiers locaux chunkés" |
+| Treeview | `files_tree` | Liste des fichiers (nom, chunks, date) |
+
+#### Méthodes principales
+
+| Méthode | Description |
+|---------|-------------|
+| `_chunk_file()` | Ouvre dialogue fichier et lance le chunking |
+| `_distribute_file()` | Distribue le fichier sélectionné vers les pairs |
+| `_fetch_file()` | Télécharge un fichier depuis le réseau P2P |
+| `_refresh_local()` | Actualise la liste des fichiers chunkés |
+| `_toggle_server()` | Démarre/arrête le serveur de chunks |
+| `_delete_file()` | Supprime un fichier chunké localement |
+| `_run_async(coro)` | Exécute une coroutine dans un thread séparé |
+
+#### Intégration avec ChunkingManager
+
+```python
+# Dans gui.py, le ChunkingManager est initialisé au démarrage
+self.chunking_mgr = ChunkingManager(peer_uuid=self._peer_uuid)
+
+# P2PView reçoit la référence
+p2p_view = P2PView(content_frame, chunking_mgr=self.chunking_mgr)
+```
+
+#### États du serveur
+
+| État | Indicateur | Description |
+|------|------------|-------------|
+| Arrêté | 🔴 Serveur arrêté | Aucune écoute de connexions |
+| En cours | 🟢 Serveur actif | Accepte les requêtes de chunks |
+
+---
+
 ## 🔄 Flux de données principaux
 
 ### 1. Connexion au tracker
@@ -479,6 +602,108 @@ def main():
                     │   'key': '64_chars_hex_key...'   │
                     │ }                                │
                     └──────────────────────────────────┘
+```
+
+### 4. Chunking et distribution P2P (NOUVEAU)
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Fichier     │───►│  P2PView     │───►│ChunkingMgr   │
+│  source      │    │ _chunk_file()│    │ chunk_file() │
+└──────────────┘    └──────────────┘    └──────────────┘
+                                               │
+                    ┌──────────────────────────┘
+                    ▼
+             ┌─────────────┐    ┌─────────────┐
+             │ ReedSolomon │    │ ChunkStore  │
+             │  encode()   │───►│  save_chunk │
+             └─────────────┘    └──────┬──────┘
+                                       │
+                                       ▼
+                               ┌─────────────┐
+                               │  ~/.decen.  │
+                               │  /chunks/   │
+                               └─────────────┘
+```
+
+### 5. Récupération depuis le réseau P2P
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  P2PView     │───►│ ChunkingMgr  │───►│  PeerRPC     │
+│ _fetch_file()│    │ fetch_file() │    │  (clients)   │
+└──────────────┘    └──────────────┘    └──────────────┘
+                           │                   │
+                           │                   ▼
+                           │            ┌──────────────┐
+                           │            │  Pairs P2P   │
+                           │            │  (réseau)    │
+                           │            └──────────────┘
+                           ▼
+                    ┌──────────────┐
+                    │ ReedSolomon  │
+                    │  decode()    │
+                    └──────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  Fichier     │
+                    │ reconstitué  │
+                    └──────────────┘
+```
+
+### 6. Auto-sync du container.dat (NOUVEAU)
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  FilesView   │───►│save_container│───►│_trigger_auto_│
+│  (action)    │    │     ()       │    │   chunk()    │
+└──────────────┘    └──────────────┘    └──────────────┘
+                                               │
+                                               ▼
+                    ┌──────────────────────────────────┐
+                    │        Container.dat modifié     │
+                    │                                  │
+                    │  1. Hash calculé                 │
+                    │  2. Ancien chunking supprimé     │
+                    │  3. Nouveau chunking créé        │
+                    │  4. Distribution aux pairs       │
+                    └──────────────────────────────────┘
+```
+
+### 7. Restauration automatique du container.dat (NOUVEAU)
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Démarrage   │───►│ _check_and_  │───►│ container.dat│
+│  GUI         │    │ restore_     │    │  existe ?    │
+└──────────────┘    │ container()  │    └──────────────┘
+                    └──────────────┘           │
+                                        ┌──────┴──────┐
+                                        │             │
+                                       OUI           NON
+                                        │             │
+                                        ▼             ▼
+                                    [Rien]    ┌──────────────┐
+                                              │ Chunks en    │
+                                              │ base ?       │
+                                              └──────────────┘
+                                                    │
+                                              ┌─────┴─────┐
+                                              │           │
+                                             NON         OUI
+                                              │           │
+                                              ▼           ▼
+                                          [Rien]  ┌──────────────┐
+                                                  │reconstruct_  │
+                                                  │   file()     │
+                                                  └──────────────┘
+                                                        │
+                                                        ▼
+                                                  ┌──────────────┐
+                                                  │container.dat │
+                                                  │  restauré    │
+                                                  └──────────────┘
 ```
 
 ---
@@ -549,6 +774,256 @@ view_menu.add_command(label="Ma Vue", command=lambda: self.show_view('nouvelle')
 
 ---
 
+## 📦 Module Chunking P2P (chunking/)
+
+Le module `chunking/` implémente un système complet de fragmentation de fichiers avec codes de correction d'erreurs Reed-Solomon et Local Reconstruction Codes (LRC) pour le stockage distribué P2P.
+
+### Architecture en couches
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Couche Orchestration (chunking_mgr.py, replication_mgr.py) │
+│    - Coordination des opérations de haut niveau             │
+│    - Gestion du cycle de vie des fichiers (30 jours)        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────┴─────────────────────────────┐
+│          Couche Encodage (reed_solomon.py)                │
+│    - Encodage Reed-Solomon (K=6 data, M=4 parité)         │
+│    - Local Reconstruction Codes (LRC)                     │
+└───────────────────────────────────────────────────────────┘
+                              │
+┌──────────────────┬──────────┴───────────┬─────────────────┐
+│ Couche Stockage  │                      │ Couche Réseau   │
+│ (chunk_store.py) │   (chunk_db.py)      │ (peer_rpc.py,   │
+│ Stockage disque  │   Métadonnées SQL    │  chunk_net.py)  │
+└──────────────────┴──────────────────────┴─────────────────┘
+```
+
+### Configuration (config.py)
+
+| Paramètre | Valeur défaut | Description |
+|-----------|---------------|-------------|
+| `REED_SOLOMON.K` | 6 | Chunks de données originaux |
+| `REED_SOLOMON.M` | 4 | Chunks de parité |
+| `DEFAULT_CHUNK_SIZE_MB` | 10 | Taille par défaut d'un chunk |
+| `RETENTION.DAYS` | 30 | Durée de rétention |
+| `LRC.LOCAL_GROUP_SIZE` | 2 | Taille des groupes LRC |
+| `MIN_RELIABILITY_SCORE` | 0.5 | Score minimum pour sélection peer |
+
+Variables d'environnement configurables:
+- `DECENTRALIS_RS_K`, `DECENTRALIS_RS_M` - Paramètres Reed-Solomon
+- `DECENTRALIS_CHUNK_SIZE_MB` - Taille des chunks
+- `DECENTRALIS_RETENTION_DAYS` - Durée de rétention
+
+### Modèles de données (models.py)
+
+| Classe | Description |
+|--------|-------------|
+| `ChunkMetadata` | Métadonnées complètes d'un fichier chunké |
+| `StoredChunk` | Chunk stocké localement sur le disque |
+| `ChunkAssignment` | Attribution d'un chunk à un peer |
+| `ReplicationTask` | Tâche de relocalisation d'un chunk |
+| `PeerInfo` | Informations sur un peer du réseau |
+| `LocalGroup` | Groupe local pour LRC |
+
+### Reed-Solomon + LRC (reed_solomon.py)
+
+**Classe**: `ReedSolomonEncoder`
+
+L'encodeur implémente:
+- **Reed-Solomon Erasure Coding**: Permet de reconstruire les données avec n'importe quels K chunks sur N (K+M)
+- **LRC (Local Reconstruction Codes)**: Groupes locaux permettant une récupération rapide sans accéder à tous les chunks
+
+```python
+# Exemple d'utilisation
+from chunking import ReedSolomonEncoder
+
+encoder = ReedSolomonEncoder(k=6, m=4)
+data_chunks, parity_chunks = encoder.encode_data(file_data)
+
+# Reconstruction avec chunks manquants
+available_chunks = {0: chunk0, 2: chunk2, 4: chunk4, 6: parity0, 7: parity1, 8: parity2}
+recovered_data = encoder.decode_data(available_chunks, original_size)
+```
+
+| Méthode | Description |
+|---------|-------------|
+| `encode_data(data)` | Encode en K chunks data + M chunks parité |
+| `decode_data(chunks, size)` | Reconstruit depuis >= K chunks |
+| `create_local_groups(k, group_size)` | Crée les groupes LRC |
+| `encode_local_recovery_symbols(chunks, groups)` | Génère symboles LRC |
+
+### Stockage local (chunk_store.py)
+
+**Classe**: `ChunkStore`
+
+Structure du répertoire:
+```
+~/.decentralis/chunks/
+├── {owner_uuid}/
+│   ├── {file_uuid}/
+│   │   ├── metadata.json
+│   │   ├── 0.chunk
+│   │   ├── 1.chunk
+│   │   └── ...
+│   └── {file_uuid2}/
+└── {owner_uuid2}/
+```
+
+| Méthode | Description |
+|---------|-------------|
+| `store_chunk(owner, file, idx, data)` | Stocke un chunk sur disque |
+| `get_chunk(owner, file, idx)` | Récupère un chunk |
+| `store_metadata(owner, file, metadata)` | Stocke les métadonnées JSON |
+| `validate_chunk(owner, file, idx, expected_hash)` | Valide l'intégrité |
+| `delete_file_chunks(owner, file)` | Supprime tous les chunks d'un fichier |
+
+### Base de données (chunk_db.py)
+
+**Classe**: `ChunkDatabase`
+
+Tables SQLite:
+- `file_metadata` - Métadonnées des fichiers chunkés
+- `chunks` - Chunks stockés localement
+- `chunk_locations` - Index de réplication (où sont les chunks)
+- `replication_history` - Historique des relocalisations
+- `peers` - Informations sur les peers
+- `chunk_assignments` - Assignations chunk → peer
+
+| Méthode | Description |
+|---------|-------------|
+| `add_file_metadata(metadata)` | Ajoute les métadonnées d'un fichier |
+| `get_file_metadata(file_uuid)` | Récupère les métadonnées |
+| `get_file_metadata_by_name(filename, owner)` | **Récupère métadonnées par nom** (NOUVEAU) |
+| `add_chunk(chunk)` | Ajoute un chunk stocké |
+| `get_chunks_by_file(file_uuid)` | Liste les chunks d'un fichier |
+| `get_locations_by_peer(peer_uuid)` | Chunks stockés par un peer |
+| `get_all_file_metadata()` | **Liste tous les fichiers chunkés** (NOUVEAU) |
+| `get_local_stats()` | **Statistiques locales** (NOUVEAU) |
+| `cleanup_expired_files()` | Supprime les fichiers expirés |
+
+### Gestionnaire principal (chunking_mgr.py)
+
+**Classe**: `ChunkingManager`
+
+Point d'entrée principal pour toutes les opérations de chunking.
+
+```python
+import asyncio
+from chunking import ChunkingManager
+
+async def main():
+    mgr = ChunkingManager("my-peer-uuid", "/path/to/storage", "/path/to/db.sqlite")
+    
+    # Chunker un fichier
+    file_uuid = await mgr.chunk_file("/path/to/container.dat", "owner-uuid")
+    
+    # Distribuer aux peers
+    result = await mgr.distribute_chunks(file_uuid, "owner-uuid")
+    
+    # Reconstruire un fichier
+    await mgr.reconstruct_file(file_uuid, "owner-uuid", "/path/to/output.dat")
+    
+    await mgr.shutdown()
+
+asyncio.run(main())
+```
+
+| Méthode | Description |
+|---------|-------------|
+| `chunk_file(path, owner)` | Découpe un fichier en chunks RS+LRC |
+| `distribute_chunks(file_uuid, owner)` | Distribue vers les peers |
+| `reconstruct_file(file_uuid, owner, output)` | Reconstruit depuis les chunks |
+| `get_file_status(file_uuid)` | État d'un fichier (chunks disponibles) |
+| `start_background_tasks()` | Lance les tâches de maintenance |
+| `shutdown()` | Arrêt propre |
+
+### Réplication (replication_mgr.py)
+
+**Classe**: `ReplicationManager`
+
+Gère la relocalisation des chunks quand un peer se déconnecte.
+
+| Méthode | Description |
+|---------|-------------|
+| `on_peer_disconnected(peer_uuid)` | Gère la déconnexion d'un peer |
+| `process_pending_relocations()` | Traite les relocalisations en attente |
+| `select_replacement_peer(chunk)` | Sélectionne un peer de remplacement |
+| `cleanup_expired_chunks()` | Nettoie les chunks expirés |
+
+### Communication P2P (peer_rpc.py, chunk_net.py)
+
+**Client RPC** (`PeerRPC`): Communication sortante vers les autres peers.
+**Serveur TCP** (`ChunkNetworkServer`): Écoute les requêtes entrantes.
+
+Protocole JSON-RPC 2.0 sur TCP avec préfixe de longueur.
+
+Méthodes RPC disponibles:
+- `ping` - Vérification de connexion
+- `store_chunk` - Stockage d'un chunk
+- `get_chunk` - Récupération d'un chunk
+- `delete_chunk` - Suppression d'un chunk
+- `get_chunk_info` - Informations sur un chunk
+- `list_chunks` - Liste des chunks d'un fichier
+- `announce_file` - Annonce d'un nouveau fichier
+- `search_file` - Recherche d'un fichier
+
+### Exceptions (exceptions.py)
+
+Hiérarchie d'exceptions spécifiques:
+
+```
+ChunkingException (base)
+├── ChunkEncodingError      # Erreur d'encodage RS
+├── ChunkDecodingError      # Erreur de décodage
+├── InsufficientChunksError # Pas assez de chunks pour reconstruction
+├── ChunkNotFoundError      # Chunk introuvable
+├── ChunkValidationError    # Hash invalide
+├── ChunkStorageError       # Erreur de stockage disque
+├── ChunkDatabaseError      # Erreur SQL
+├── FileMetadataNotFoundError # Métadonnées introuvables
+├── PeerCommunicationError  # Erreur réseau P2P
+├── ReplicationError        # Erreur de relocalisation
+├── ConfigurationError      # Configuration invalide
+└── SignatureValidationError # Signature invalide
+```
+
+### Flux de chunking complet
+
+```
+1. chunk_file(path, owner)
+   ├── Lecture du fichier
+   ├── Calcul du hash SHA-256
+   ├── Encodage Reed-Solomon → K data + M parity chunks
+   ├── Création groupes LRC → symboles de récupération locaux
+   ├── Stockage local (chunk_store)
+   └── Enregistrement métadonnées (chunk_db)
+
+2. distribute_chunks(file_uuid, owner)
+   ├── Récupération liste des peers (via tracker)
+   ├── Sélection des peers fiables (score >= 0.5)
+   ├── Assignation round-robin des chunks
+   ├── Envoi via RPC (peer_rpc)
+   └── Enregistrement des localisations (chunk_db)
+
+3. reconstruct_file(file_uuid, owner, output)
+   ├── Récupération métadonnées
+   ├── Collecte des chunks (locaux + distants)
+   ├── Décodage Reed-Solomon/LRC
+   ├── Vérification hash
+   └── Écriture du fichier reconstitué
+
+4. on_peer_disconnected(peer_uuid)
+   ├── Identification des chunks affectés
+   ├── Création tâches de relocalisation
+   ├── Sélection nouveaux peers
+   ├── Récupération depuis peers qui ont encore les chunks
+   └── Mise à jour des localisations
+```
+
+---
+
 ## ⚠️ Points d'attention pour les développeurs
 
 ### Sécurité
@@ -566,8 +1041,15 @@ view_menu.add_command(label="Ma Vue", command=lambda: self.show_view('nouvelle')
 - Clés de chiffrement: format hexadécimal (64 caractères pour 32 bytes)
 - Encodage des fichiers dans le conteneur: Base64
 
+### Chunking P2P
+- Le module `chunking/` utilise **asyncio** pour les opérations réseau
+- Les chunks sont stockés avec hash SHA-256 pour validation d'intégrité
+- Reed-Solomon permet de perdre jusqu'à **M chunks** et toujours reconstruire
+- LRC ajoute une récupération locale rapide sans accéder à tous les chunks
+- Toutes les opérations réseau ont un timeout configurable (défaut: 30s)
+- Les peers sont sélectionnés par score de fiabilité (0.0 à 1.0)
+
 ### Limitations actuelles
-- Le gestionnaire de fichiers est **local uniquement** (pas de transfert P2P)
 - Pas de persistance de la passphrase entre sessions (intentionnel)
 - Un seul fichier conteneur par installation
 
@@ -575,12 +1057,20 @@ view_menu.add_command(label="Ma Vue", command=lambda: self.show_view('nouvelle')
 
 ## 🚀 Évolutions prévues
 
-- [ ] Intégration complète du protocole P2P pour envoi/réception de fichiers
-- [ ] Réplication des fichiers vers plusieurs peers
+- [x] ~~Système de chunking avec Reed-Solomon~~ ✅ Implémenté
+- [x] ~~Codes de correction LRC~~ ✅ Implémenté
+- [x] ~~Base de données des métadonnées~~ ✅ Implémenté
+- [x] ~~Protocole RPC P2P~~ ✅ Implémenté
+- [x] ~~Intégration chunking dans GUI~~ ✅ Implémenté (P2PView)
+- [x] ~~Auto-chunking du container.dat~~ ✅ Implémenté
+- [x] ~~Auto-sync vers les pairs~~ ✅ Implémenté
+- [x] ~~Restauration automatique du container.dat~~ ✅ Implémenté
+- [ ] Réplication automatique lors de déconnexion peer
 - [ ] Interface améliorée (icônes, drag & drop, barre de progression)
 - [ ] Stockage sécurisé de la clé via keyring système
 - [ ] Support de multiples conteneurs/profils
 - [ ] Historique des transferts
+- [ ] Chiffrement des chunks avant distribution (hybride avec clés peer)
 
 ---
 

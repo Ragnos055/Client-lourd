@@ -456,20 +456,122 @@ class ChunkDatabase:
         
         return files
     
+    def get_file_metadata_by_name(
+        self, 
+        filename: str, 
+        owner_uuid: Optional[str] = None
+    ) -> Optional[ChunkMetadata]:
+        """
+        Récupère les métadonnées d'un fichier par son nom.
+        
+        Args:
+            filename: Nom du fichier (ex: 'container.dat')
+            owner_uuid: UUID du propriétaire (optionnel pour filtrer)
+            
+        Returns:
+            ChunkMetadata ou None si non trouvé
+        """
+        cursor = self.conn.cursor()
+        
+        if owner_uuid:
+            cursor.execute("""
+                SELECT file_uuid FROM file_metadata 
+                WHERE original_filename = ? AND owner_uuid = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (filename, owner_uuid))
+        else:
+            cursor.execute("""
+                SELECT file_uuid FROM file_metadata 
+                WHERE original_filename = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (filename,))
+        
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        return self.get_file_metadata(row['file_uuid'])
+    
+    def get_all_file_metadata(self) -> List[ChunkMetadata]:
+        """
+        Récupère tous les fichiers de la base de données.
+        
+        Returns:
+            Liste de tous les ChunkMetadata
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT file_uuid FROM file_metadata ORDER BY created_at DESC
+        """)
+        
+        files = []
+        for row in cursor.fetchall():
+            metadata = self.get_file_metadata(row['file_uuid'])
+            if metadata:
+                files.append(metadata)
+        
+        return files
+    
+    def get_local_stats(self) -> Dict[str, Any]:
+        """
+        Récupère les statistiques locales.
+        
+        Returns:
+            Dictionnaire avec les stats locales
+        """
+        cursor = self.conn.cursor()
+        
+        # Compter les chunks stockés localement
+        cursor.execute("SELECT COUNT(*) as count FROM chunks WHERE status = 'verified'")
+        chunks_count = cursor.fetchone()['count']
+        
+        # Compter les fichiers
+        cursor.execute("SELECT COUNT(*) as count FROM file_metadata")
+        files_count = cursor.fetchone()['count']
+        
+        # Taille totale
+        cursor.execute("SELECT SUM(size_bytes) as total FROM chunks")
+        row = cursor.fetchone()
+        total_size = row['total'] if row['total'] else 0
+        
+        return {
+            'chunks_count': chunks_count,
+            'files_count': files_count,
+            'total_size_bytes': total_size,
+        }
+    
     def delete_file_metadata(self, file_uuid: str) -> None:
         """
-        Supprime les métadonnées d'un fichier.
+        Supprime les métadonnées d'un fichier et ses chunks associés.
         
         Args:
             file_uuid: UUID du fichier à supprimer
         """
         cursor = self.conn.cursor()
+        
+        # Supprimer les chunks associés
+        cursor.execute("""
+            DELETE FROM chunks WHERE file_uuid = ?
+        """, (file_uuid,))
+        
+        # Supprimer les locations
+        cursor.execute("""
+            DELETE FROM chunk_locations WHERE file_uuid = ?
+        """, (file_uuid,))
+        
+        # Supprimer les assignments
+        cursor.execute("""
+            DELETE FROM chunk_assignments WHERE file_uuid = ?
+        """, (file_uuid,))
+        
+        # Supprimer les métadonnées
         cursor.execute("""
             DELETE FROM file_metadata WHERE file_uuid = ?
         """, (file_uuid,))
+        
         if not self._in_transaction:
             self.conn.commit()
-        self.logger.debug(f"Métadonnées supprimées: {file_uuid}")
+        self.logger.debug(f"Fichier et chunks supprimés: {file_uuid}")
     
     def get_file_by_uuid(self, file_uuid: str, owner_uuid: str) -> Optional[ChunkMetadata]:
         """

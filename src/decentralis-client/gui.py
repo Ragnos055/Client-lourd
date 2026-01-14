@@ -3,11 +3,22 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
 import secrets
 import os
+import asyncio
+import uuid
 
 from connection.connection import connection
 from views.peers_view import PeersView
 from views.files_view import FilesView
 from views.encryption_view import EncryptionView
+from views.p2p_view import P2PView
+
+# Import du module chunking
+try:
+    from chunking import ChunkingManager, ChunkDatabase, ChunkStore, ChunkNetworkServer, PeerRPC
+    CHUNKING_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: chunking module not available: {e}")
+    CHUNKING_AVAILABLE = False
 
 
 class DecentralisGUI:
@@ -50,6 +61,8 @@ class DecentralisGUI:
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Pairs", command=lambda: self.show_view('peers'))
         view_menu.add_command(label="Gestionnaire de fichiers", command=lambda: self.show_view('files'))
+        view_menu.add_command(label="Réseau P2P", command=lambda: self.show_view('p2p'))
+        view_menu.add_separator()
         view_menu.add_command(label="Chiffrement", command=lambda: self.show_view('encryption'))
         menubar.add_cascade(label="Vue", menu=view_menu)
         root.config(menu=menubar)
@@ -72,6 +85,11 @@ class DecentralisGUI:
         # encryption settings object (cached for the session)
         self.encryption_settings = {}
         self._cached_passphrase = None
+        
+        # Chunking P2P manager
+        self.chunking_mgr = None
+        self._peer_uuid = str(uuid.uuid4())  # UUID unique pour ce peer
+        self._init_chunking()
 
         self.frames['peers'] = PeersView(container, self)
         self.frames['peers'].grid(row=0, column=0, sticky='nsew')
@@ -90,12 +108,185 @@ class DecentralisGUI:
         self.frames['files'] = FilesView(container, self)
         self.frames['files'].grid(row=0, column=0, sticky='nsew')
 
+        # Vue P2P
+        self.frames['p2p'] = P2PView(container, self)
+        self.frames['p2p'].grid(row=0, column=0, sticky='nsew')
+
+        # Vérifier et restaurer container.dat si nécessaire
+        self._check_and_restore_container()
 
         self.show_view('files')
 
         # connection state
         self.conn = None
         self._updating = False
+        
+        # Bind cleanup on window close
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _init_chunking(self):
+        """Initialise le système de chunking P2P."""
+        if not CHUNKING_AVAILABLE:
+            print("Module chunking non disponible")
+            return
+        
+        try:
+            # Chemins pour le chunking
+            chunks_dir = os.path.join(self.config_dir, 'chunks')
+            db_path = os.path.join(self.config_dir, 'chunk_metadata.db')
+            
+            # Créer le ChunkingManager
+            self.chunking_mgr = ChunkingManager(
+                peer_uuid=self._peer_uuid,
+                storage_dir=chunks_dir,
+                db_path=db_path,
+                connection_handler=None  # Sera mis à jour lors de la connexion
+            )
+            
+            print(f"ChunkingManager initialisé: peer={self._peer_uuid[:8]}...")
+            
+        except Exception as e:
+            print(f"Erreur initialisation chunking: {e}")
+            self.chunking_mgr = None
+
+    def _check_and_restore_container(self):
+        """
+        Vérifie si container.dat existe localement.
+        Si non, tente de le restaurer depuis les chunks distribués sur les pairs.
+        """
+        container_path = os.path.join(self.storage_dir, 'container.dat')
+        
+        # Si le container existe déjà, rien à faire
+        if os.path.exists(container_path):
+            print("[Container] container.dat trouvé localement")
+            return
+        
+        # Pas de chunking manager = pas de restauration possible
+        if not self.chunking_mgr:
+            print("[Container] Pas de ChunkingManager, restauration impossible")
+            return
+        
+        # Vérifier si on a des chunks du container dans notre base
+        try:
+            metadata = self.chunking_mgr.db.get_file_metadata_by_name(
+                'container.dat', 
+                self._peer_uuid
+            )
+            
+            if not metadata:
+                # Chercher aussi sans filtre de propriétaire (au cas où)
+                metadata = self.chunking_mgr.db.get_file_metadata_by_name('container.dat')
+            
+            if not metadata:
+                print("[Container] Aucun container.dat chunké trouvé en base")
+                return
+            
+            # On a trouvé des métadonnées, demander à l'utilisateur
+            if not self.encryption_settings or not self.encryption_settings.get('key'):
+                print("[Container] Clé de chiffrement non disponible pour restauration")
+                return
+            
+            # Afficher un dialogue de confirmation
+            answer = messagebox.askyesno(
+                'Restauration du conteneur',
+                'Le fichier container.dat n\'existe pas localement mais des chunks '
+                'ont été trouvés. Voulez-vous tenter de le restaurer depuis les chunks ?'
+            )
+            
+            if not answer:
+                return
+            
+            # Lancer la restauration dans un thread
+            self._restore_container_async(metadata.file_uuid, metadata.owner_uuid, container_path)
+            
+        except Exception as e:
+            print(f"[Container] Erreur vérification: {e}")
+
+    def _restore_container_async(self, file_uuid: str, owner_uuid: str, output_path: str):
+        """
+        Restaure le container.dat de manière asynchrone.
+        
+        Args:
+            file_uuid: UUID du fichier chunké
+            owner_uuid: UUID du propriétaire
+            output_path: Chemin de sortie pour le container restauré
+        """
+        def do_restore():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Afficher une fenêtre de progression
+                self.root.after(0, lambda: messagebox.showinfo(
+                    'Restauration',
+                    'Restauration du container.dat en cours...\n'
+                    'Cela peut prendre quelques instants.'
+                ))
+                
+                # Tenter la reconstruction
+                reconstructed_data = loop.run_until_complete(
+                    self.chunking_mgr.reconstruct_file(file_uuid, owner_uuid, output_path)
+                )
+                
+                loop.close()
+                
+                # Succès
+                self.root.after(0, lambda: self._on_container_restored(output_path))
+                
+            except Exception as e:
+                error_msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror(
+                    'Erreur de restauration',
+                    f'Impossible de restaurer container.dat:\n{error_msg}\n\n'
+                    'Il manque peut-être des chunks sur les pairs.'
+                ))
+                print(f"[Container] Erreur restauration: {e}")
+        
+        thread = threading.Thread(target=do_restore, daemon=True)
+        thread.start()
+
+    def _on_container_restored(self, container_path: str):
+        """
+        Callback appelé après la restauration réussie du container.
+        
+        Args:
+            container_path: Chemin du container restauré
+        """
+        messagebox.showinfo(
+            'Restauration réussie',
+            f'Le fichier container.dat a été restauré avec succès !\n\n'
+            f'Emplacement: {container_path}'
+        )
+        
+        # Rafraîchir la vue des fichiers
+        try:
+            if 'files' in self.frames:
+                self.frames['files'].refresh()
+        except Exception as e:
+            print(f"[Container] Erreur refresh après restauration: {e}")
+
+    def _on_close(self):
+        """Gère la fermeture propre de l'application."""
+        try:
+            # Fermer la connexion au tracker
+            if self.conn:
+                try:
+                    self.conn.close()
+                except:
+                    pass
+            
+            # Arrêter le ChunkingManager
+            if self.chunking_mgr:
+                try:
+                    # Créer une boucle asyncio pour shutdown
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.chunking_mgr.shutdown())
+                    loop.close()
+                except:
+                    pass
+        finally:
+            self.root.destroy()
 
     # --- Views creation ---
     # view creation is now delegated to separate view classes in files under views/

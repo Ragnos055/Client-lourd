@@ -406,6 +406,9 @@ class ChunkStore:
             self.logger.error(f"Erreur suppression fichier {file_dir}: {e}")
             return 0
     
+    # Alias pour compatibilité
+    delete_file_chunks = delete_file
+    
     def get_file_size(self, owner_uuid: str, file_uuid: str) -> int:
         """
         Calcule la taille totale occupée par un fichier (tous les chunks).
