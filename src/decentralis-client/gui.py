@@ -319,6 +319,10 @@ class DecentralisGUI:
         def create_conn():
             try:
                 self.conn = connection(srv_ip, srv_port, peer_ip, peer_port, keepalive)
+                # Mettre à jour le ChunkingManager avec le connection handler
+                if self.chunking_mgr and self.conn:
+                    self.chunking_mgr.set_connection_handler(self.conn, peer_ip, peer_port)
+                    print(f"[Chunking] Connection handler mis à jour: {peer_ip}:{peer_port}")
             except Exception as e:
                 self.conn = None
                 self.root.after(0, lambda: messagebox.showerror("Erreur de connexion", str(e)))
@@ -338,6 +342,9 @@ class DecentralisGUI:
                 except Exception:
                     pass
                 self.conn = None
+            # Déconnecter aussi le ChunkingManager du tracker
+            if self.chunking_mgr:
+                self.chunking_mgr.set_connection_handler(None)
         finally:
             self._updating = False
             # clear peers view listbox if present

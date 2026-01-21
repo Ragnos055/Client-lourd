@@ -106,6 +106,7 @@ class ChunkingManager:
         self.logger = logger or logging.getLogger(__name__)
         self.connection_handler = connection_handler
         self.peer_rpc = peer_rpc
+        self._local_addr = None  # Sera défini plus tard (ip:port local)
         
         # Initialiser les composants
         try:
@@ -135,6 +136,20 @@ class ChunkingManager:
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
         self._running = False
+    
+    def set_connection_handler(self, handler, local_ip: str = None, local_port: int = None):
+        """
+        Définit le handler de connexion au tracker.
+        
+        Args:
+            handler: Instance de connection (tracker)
+            local_ip: IP locale de ce peer
+            local_port: Port local de ce peer
+        """
+        self.connection_handler = handler
+        if local_ip and local_port:
+            self._local_addr = f"{local_ip}:{local_port}"
+            self.logger.info(f"Connection handler défini, local_addr={self._local_addr}")
     
     # ==========================================================================
     # CHUNKING DE FICHIERS
@@ -499,15 +514,40 @@ class ChunkingManager:
         if min_reliability is None:
             min_reliability = self.config['PEER_SELECTION']['MIN_RELIABILITY_SCORE']
         
-        # Récupérer les peers en ligne depuis la base
-        peers = self.db.get_online_peers()
+        peers = []
+        
+        # 1. Essayer de récupérer les peers depuis le connection_handler (tracker)
+        if self.connection_handler is not None:
+            try:
+                resp = self.connection_handler.get_peers()
+                tracker_peers = resp.get('peers', []) if isinstance(resp, dict) else []
+                for p in tracker_peers:
+                    # Convertir le format tracker vers notre format
+                    peer_info = {
+                        'uuid': p.get('uuid', f"{p.get('ip')}:{p.get('port')}"),
+                        'ip': p.get('ip'),
+                        'port': p.get('port'),
+                        'reliability_score': 1.0,  # Peers du tracker considérés fiables
+                        'is_online': True
+                    }
+                    peers.append(peer_info)
+                self.logger.debug(f"Peers récupérés du tracker: {len(peers)}")
+            except Exception as e:
+                self.logger.warning(f"Erreur récupération peers du tracker: {e}")
+        
+        # 2. Ajouter les peers de la base locale si pas de tracker
+        if not peers:
+            peers = self.db.get_online_peers()
         
         # Filtrer
         filtered = []
         for peer in peers:
-            # Exclure soi-même
-            if exclude_self and peer['uuid'] == self.peer_uuid:
-                continue
+            # Exclure soi-même (par UUID ou par IP:port)
+            if exclude_self:
+                peer_id = peer.get('uuid', '')
+                peer_addr = f"{peer.get('ip')}:{peer.get('port')}"
+                if peer_id == self.peer_uuid or peer_addr == self._local_addr:
+                    continue
             
             # Vérifier le score de fiabilité
             if peer.get('reliability_score', 0) < min_reliability:
@@ -517,6 +557,8 @@ class ChunkingManager:
         
         # Trier par score de fiabilité décroissant
         filtered.sort(key=lambda p: p.get('reliability_score', 0), reverse=True)
+        
+        self.logger.debug(f"Peers disponibles après filtrage: {len(filtered)}")
         
         return filtered
     
