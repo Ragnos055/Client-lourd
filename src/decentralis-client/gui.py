@@ -3,10 +3,25 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
 import secrets
 import os
+import sys
 import asyncio
 import uuid
 
 from connection.connection import connection
+
+
+def get_app_dir():
+    """
+    Retourne le répertoire de l'application.
+    - Si exécuté depuis un exécutable PyInstaller: répertoire de l'exécutable
+    - Si exécuté en mode script: répertoire du script principal
+    """
+    if getattr(sys, 'frozen', False):
+        # Exécuté depuis un exécutable PyInstaller
+        return os.path.dirname(sys.executable)
+    else:
+        # Exécuté en mode script
+        return os.path.dirname(os.path.abspath(__file__))
 from views.peers_view import PeersView
 from views.files_view import FilesView
 from views.encryption_view import EncryptionView
@@ -75,8 +90,8 @@ class DecentralisGUI:
 
         # Frames for each view (now provided by separate modules)
         self.frames = {}
-        # storage directory for files (per-user storage)
-        self.config_dir = os.path.join(os.path.expanduser('~'), '.decentralis')
+        # storage directory for files (relative to executable for portability)
+        self.config_dir = os.path.join(get_app_dir(), 'data')
         os.makedirs(self.config_dir, exist_ok=True)
         self.storage_dir = os.path.join(self.config_dir, 'storage')
         os.makedirs(self.storage_dir, exist_ok=True)

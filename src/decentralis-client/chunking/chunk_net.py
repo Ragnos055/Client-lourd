@@ -129,24 +129,33 @@ class ChunkNetworkServer:
             port: Port d'écoute (défaut: 7654)
         """
         if self._running:
-            self.logger.warning("Serveur déjà en cours d'exécution")
+            self.logger.warning("[SERVER] Serveur déjà en cours d'exécution")
             return
         
-        self._server = await asyncio.start_server(
-            self._handle_client,
-            host,
-            port,
-            limit=self.config.get('MAX_MESSAGE_SIZE', 10 * 1024 * 1024)
-        )
+        self.logger.info(f"[SERVER] Démarrage du serveur TCP sur {host}:{port}...")
         
-        self._running = True
-        self._start_time = datetime.utcnow()
-        
-        addr = self._server.sockets[0].getsockname()
-        self.logger.info(f"Serveur démarré sur {addr[0]}:{addr[1]}")
-        
-        # Lancer la boucle de service en arrière-plan
-        asyncio.create_task(self._server.serve_forever())
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_client,
+                host,
+                port,
+                limit=self.config.get('MAX_MESSAGE_SIZE', 10 * 1024 * 1024)
+            )
+            
+            self._running = True
+            self._start_time = datetime.utcnow()
+            
+            addr = self._server.sockets[0].getsockname()
+            self.logger.info(f"[SERVER] ✓ Serveur TCP démarré sur {addr[0]}:{addr[1]}")
+            self.logger.info(f"[SERVER] En attente de connexions entrantes...")
+            
+            # Lancer la boucle de service en arrière-plan
+            asyncio.create_task(self._server.serve_forever())
+            
+        except OSError as e:
+            self.logger.error(f"[SERVER] ✗ Impossible de démarrer le serveur: {e}")
+            self.logger.error(f"[SERVER] Le port {port} est peut-être déjà utilisé")
+            raise
     
     async def stop(self) -> None:
         """
@@ -199,7 +208,7 @@ class ChunkNetworkServer:
             writer: StreamWriter pour écrire les données
         """
         addr = writer.get_extra_info('peername')
-        self.logger.debug(f"Nouvelle connexion depuis {addr}")
+        self.logger.info(f"[SERVER] Nouvelle connexion entrante depuis {addr}")
         
         # Créer une tâche pour cette connexion
         task = asyncio.current_task()
@@ -209,17 +218,19 @@ class ChunkNetworkServer:
             while self._running:
                 try:
                     # Lire la longueur du message (4 bytes)
+                    self.logger.debug(f"[SERVER] Attente de données de {addr}...")
                     length_bytes = await asyncio.wait_for(
                         reader.readexactly(4),
                         timeout=self.config['RPC_TIMEOUT_SECONDS']
                     )
                     message_length = int.from_bytes(length_bytes, 'big')
+                    self.logger.debug(f"[SERVER] Message de {message_length} bytes attendu de {addr}")
                     
                     # Vérifier la taille max
                     max_size = self.config.get('MAX_MESSAGE_SIZE', 10 * 1024 * 1024)
                     if message_length > max_size:
                         self.logger.warning(
-                            f"Message trop grand: {message_length} > {max_size}"
+                            f"[SERVER] Message trop grand: {message_length} > {max_size}"
                         )
                         break
                     
@@ -231,9 +242,12 @@ class ChunkNetworkServer:
                     
                     # Parser la requête
                     request = json.loads(message_bytes.decode('utf-8'))
+                    method = request.get('method', 'unknown')
+                    self.logger.info(f"[SERVER] Requête reçue de {addr}: method={method}")
                     
                     # Traiter et répondre
                     response = await self._process_request(request)
+                    self.logger.debug(f"[SERVER] Réponse: {str(response)[:200]}...")
                     
                     # Envoyer la réponse
                     response_bytes = json.dumps(response).encode('utf-8')
@@ -241,15 +255,16 @@ class ChunkNetworkServer:
                     
                     writer.write(length_prefix + response_bytes)
                     await writer.drain()
+                    self.logger.info(f"[SERVER] Réponse envoyée à {addr} ({len(response_bytes)} bytes)")
                     
                 except asyncio.TimeoutError:
-                    self.logger.debug(f"Timeout de connexion pour {addr}")
+                    self.logger.debug(f"[SERVER] Timeout de connexion pour {addr}")
                     break
                 except asyncio.IncompleteReadError:
-                    self.logger.debug(f"Connexion fermée par {addr}")
+                    self.logger.debug(f"[SERVER] Connexion fermée par {addr}")
                     break
                 except json.JSONDecodeError as e:
-                    self.logger.warning(f"JSON invalide de {addr}: {e}")
+                    self.logger.warning(f"[SERVER] JSON invalide de {addr}: {e}")
                     # Envoyer une erreur
                     error_response = self._make_error_response(
                         None, -32700, "Parse error"

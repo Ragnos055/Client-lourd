@@ -39,6 +39,8 @@ from .exceptions import (
 from .chunk_db import ChunkDatabase
 from .chunk_store import ChunkStore
 from .reed_solomon import ReedSolomonEncoder, create_encoder
+from .chunk_net import ChunkNetworkServer
+from .peer_rpc import PeerRPC
 
 
 class ChunkingManager:
@@ -107,6 +109,7 @@ class ChunkingManager:
         self.connection_handler = connection_handler
         self.peer_rpc = peer_rpc
         self._local_addr = None  # Sera défini plus tard (ip:port local)
+        self._peer_address_map = {}  # Mapping peer_uuid -> (ip, port)
         
         # Initialiser les composants
         try:
@@ -118,6 +121,21 @@ class ChunkingManager:
             self.encoder = create_encoder(
                 k=rs_config['K'],
                 m=rs_config['M'],
+                logger=self.logger
+            )
+            
+            # Créer le serveur réseau P2P pour recevoir les chunks
+            self.network_server = ChunkNetworkServer(
+                own_uuid=peer_uuid,
+                chunk_store=self.store,
+                chunk_db=self.db,
+                logger=self.logger
+            )
+            
+            # Créer le client RPC P2P pour envoyer les chunks
+            self.peer_rpc = PeerRPC(
+                own_uuid=peer_uuid,
+                peer_resolver=self._resolve_peer_address,
                 logger=self.logger
             )
             
@@ -136,6 +154,20 @@ class ChunkingManager:
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
         self._running = False
+    
+    def _resolve_peer_address(self, peer_uuid: str) -> Optional[tuple]:
+        """
+        Résout un UUID de peer en adresse (ip, port).
+        
+        Args:
+            peer_uuid: UUID du peer à résoudre
+            
+        Returns:
+            Tuple (ip, port) ou None si non trouvé
+        """
+        result = self._peer_address_map.get(peer_uuid)
+        self.logger.debug(f"Résolution peer {peer_uuid}: {result}")
+        return result
     
     def set_connection_handler(self, handler, local_ip: str = None, local_port: int = None):
         """
@@ -481,6 +513,8 @@ class ChunkingManager:
             return False
         
         try:
+            self.logger.info(f"Envoi chunk {chunk_idx} vers {peer_uuid}...")
+            
             # Utiliser le client RPC pour envoyer
             result = await self.peer_rpc.store_chunk(
                 peer_uuid=peer_uuid,
@@ -490,10 +524,17 @@ class ChunkingManager:
                 chunk_data=chunk_data,
                 content_hash=content_hash
             )
-            return result.get('success', False)
+            
+            success = result.get('success', False)
+            if success:
+                self.logger.info(f"✓ Chunk {chunk_idx} envoyé à {peer_uuid}")
+            else:
+                self.logger.warning(f"✗ Échec envoi chunk {chunk_idx} à {peer_uuid}: {result}")
+            
+            return success
             
         except Exception as e:
-            self.logger.error(f"Erreur envoi chunk à {peer_uuid}: {e}")
+            self.logger.error(f"Erreur envoi chunk {chunk_idx} à {peer_uuid}: {e}")
             return False
     
     async def _get_available_peers(
@@ -522,15 +563,35 @@ class ChunkingManager:
                 resp = self.connection_handler.get_peers()
                 tracker_peers = resp.get('peers', []) if isinstance(resp, dict) else []
                 for p in tracker_peers:
-                    # Convertir le format tracker vers notre format
+                    # Le tracker peut renvoyer soit des dicts soit des strings "ip:port"
+                    if isinstance(p, str):
+                        # Format "ip:port"
+                        parts = p.rsplit(':', 1)
+                        if len(parts) == 2:
+                            ip = parts[0]
+                            port = int(parts[1])
+                            peer_uuid = p  # Utiliser ip:port comme UUID temporaire
+                        else:
+                            continue
+                    else:
+                        # Format dict
+                        ip = p.get('ip')
+                        port = p.get('port')
+                        peer_uuid = p.get('uuid', f"{ip}:{port}")
+                    
                     peer_info = {
-                        'uuid': p.get('uuid', f"{p.get('ip')}:{p.get('port')}"),
-                        'ip': p.get('ip'),
-                        'port': p.get('port'),
+                        'uuid': peer_uuid,
+                        'ip': ip,
+                        'port': port,
                         'reliability_score': 1.0,  # Peers du tracker considérés fiables
                         'is_online': True
                     }
                     peers.append(peer_info)
+                    
+                    # Stocker dans le mapping pour la résolution
+                    self._peer_address_map[peer_uuid] = (ip, port)
+                    self.logger.info(f"Peer ajouté au mapping: {peer_uuid} -> ({ip}, {port})")
+                    
                 self.logger.debug(f"Peers récupérés du tracker: {len(peers)}")
             except Exception as e:
                 self.logger.warning(f"Erreur récupération peers du tracker: {e}")
@@ -538,6 +599,13 @@ class ChunkingManager:
         # 2. Ajouter les peers de la base locale si pas de tracker
         if not peers:
             peers = self.db.get_online_peers()
+            # Stocker dans le mapping
+            for peer in peers:
+                peer_uuid = peer.get('uuid')
+                ip = peer.get('ip')
+                port = peer.get('port')
+                if peer_uuid and ip and port:
+                    self._peer_address_map[peer_uuid] = (ip, port)
         
         # Filtrer
         filtered = []
@@ -999,6 +1067,7 @@ class ChunkingManager:
         """
         Arrête proprement le gestionnaire de chunking.
         
+        - Arrête le serveur réseau P2P
         - Arrête les tâches d'arrière-plan
         - Ferme la connexion à la base de données
         """
@@ -1007,6 +1076,20 @@ class ChunkingManager:
         # Signaler l'arrêt
         self._shutdown_event.set()
         self._running = False
+        
+        # Arrêter le serveur réseau
+        if self.network_server:
+            try:
+                await self.network_server.stop()
+            except Exception as e:
+                self.logger.warning(f"Erreur lors de l'arrêt du serveur: {e}")
+        
+        # Fermer le client RPC
+        if self.peer_rpc:
+            try:
+                await self.peer_rpc.close()
+            except Exception as e:
+                self.logger.warning(f"Erreur lors de la fermeture du client RPC: {e}")
         
         # Annuler les tâches d'arrière-plan
         for task in self._background_tasks:

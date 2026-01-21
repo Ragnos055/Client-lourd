@@ -162,9 +162,9 @@ def main():
 | `root` | `tk.Tk` | Fenêtre Tkinter racine |
 | `conn` | `connection` \| `None` | Instance de connexion au tracker |
 | `frames` | `dict[str, ttk.Frame]` | Vues chargées (`peers`, `files`, `encryption`) |
-| `config_dir` | `str` | Dossier de configuration (`~/.decentralis`) |
-| `storage_dir` | `str` | Dossier de stockage (`~/.decentralis/storage`) |
-| `retention_path` | `str` | Chemin du fichier de rétention (`~/.decentralis/key.json`) |
+| `config_dir` | `str` | Dossier de configuration (`<app_dir>/data`) |
+| `storage_dir` | `str` | Dossier de stockage (`<app_dir>/data/storage`) |
+| `retention_path` | `str` | Chemin du fichier de rétention (`<app_dir>/data/key.json`) |
 | `encryption_settings` | `dict` | Paramètres de chiffrement actuels (`algorithm`, `key`) |
 | `_cached_passphrase` | `str` \| `None` | Passphrase en mémoire pour la session |
 
@@ -712,17 +712,23 @@ p2p_view = P2PView(content_frame, chunking_mgr=self.chunking_mgr)
 
 ### Emplacement par défaut
 
-| OS | Chemin |
-|----|--------|
-| Windows | `C:\Users\<username>\.decentralis\` |
-| Linux/Mac | `~/.decentralis/` |
+Les fichiers de données sont stockés dans un sous-dossier `data/` situé **à côté de l'exécutable** (ou du script `main.py` en mode développement).
+
+Cela permet d'avoir **plusieurs instances indépendantes** du client sur le même ordinateur, chacune avec sa propre configuration et son propre conteneur.
+
+| Mode | Chemin |
+|------|--------|
+| Script | `<dossier_du_script>/data/` |
+| Exécutable (PyInstaller) | `<dossier_de_l_executable>/data/` |
 
 ### Fichiers créés
 
 | Fichier | Description |
 |---------|-------------|
-| `key.json` | Fichier de rétention (paramètres KDF + vérification) |
-| `storage/container.dat` | Conteneur chiffré contenant les fichiers |
+| `data/key.json` | Fichier de rétention (paramètres KDF + vérification) |
+| `data/storage/container.dat` | Conteneur chiffré contenant les fichiers |
+| `data/chunks/` | Répertoire des chunks P2P |
+| `data/chunk_metadata.db` | Base de données SQLite des métadonnées de chunking |
 
 ---
 

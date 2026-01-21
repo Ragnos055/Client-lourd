@@ -176,6 +176,7 @@ class PeerRPC:
             # Établir la connexion
             try:
                 timeout = self.config['RPC_TIMEOUT_SECONDS']
+                self.logger.info(f"Connexion à {ip_address}:{port} (timeout={timeout}s)...")
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip_address, port),
                     timeout=timeout
@@ -191,11 +192,12 @@ class PeerRPC:
                 )
                 
                 self._connections[peer_uuid] = conn
-                self.logger.debug(f"Connexion établie vers {peer_uuid} ({ip_address}:{port})")
+                self.logger.info(f"✓ Connexion établie vers {peer_uuid} ({ip_address}:{port})")
                 
                 return conn
                 
             except asyncio.TimeoutError:
+                self.logger.error(f"✗ Timeout connexion à {ip_address}:{port}")
                 raise PeerCommunicationError(
                     "Connection timeout",
                     peer_uuid=peer_uuid,
@@ -203,6 +205,7 @@ class PeerRPC:
                     operation="connect"
                 )
             except ConnectionRefusedError:
+                self.logger.error(f"✗ Connexion refusée par {ip_address}:{port}")
                 raise PeerCommunicationError(
                     "Connection refused",
                     peer_uuid=peer_uuid,
@@ -210,6 +213,7 @@ class PeerRPC:
                     operation="connect"
                 )
             except Exception as e:
+                self.logger.error(f"✗ Erreur connexion à {ip_address}:{port}: {e}")
                 raise PeerCommunicationError(
                     f"Connection failed: {e}",
                     peer_uuid=peer_uuid,
@@ -231,6 +235,9 @@ class PeerRPC:
             result = self.peer_resolver(peer_uuid)
             if asyncio.iscoroutine(result):
                 result = await result
+            if result is None:
+                raise ValueError(f"Resolver returned None for peer: {peer_uuid}")
+            self.logger.debug(f"Peer résolu: {peer_uuid} -> {result}")
             return result
         elif hasattr(self.peer_resolver, 'get_peer'):
             peer = self.peer_resolver.get_peer(peer_uuid)

@@ -281,20 +281,41 @@ class P2PView(ttk.Frame):
         async def do_distribute():
             try:
                 owner_uuid = mgr.peer_uuid
+                self.after(0, lambda: self._log(f"  Owner UUID: {owner_uuid[:8]}..."))
+                
+                # Vérifier les peers disponibles
+                peers = await mgr._get_available_peers(exclude_self=True)
+                self.after(0, lambda: self._log(f"  Peers disponibles: {len(peers)}"))
+                for p in peers:
+                    self.after(0, lambda p=p: self._log(f"    - {p.get('uuid')} ({p.get('ip')}:{p.get('port')})"))
+                
+                if not peers:
+                    self.after(0, lambda: self._log("  ⚠ Aucun peer disponible!"))
+                    self.after(0, lambda: self._log("  Assurez-vous que:"))
+                    self.after(0, lambda: self._log("    1. L'autre client est connecté au tracker"))
+                    self.after(0, lambda: self._log("    2. L'autre client a démarré son serveur P2P"))
+                    return
+                
                 result = await mgr.distribute_chunks(file_uuid, owner_uuid)
                 
                 distributed = result.get('distributed', 0)
                 failed = result.get('failed', 0)
                 total = result.get('total_chunks', 0)
+                error = result.get('error', '')
                 
                 msg = f"Distribution: {distributed}/{total} chunks envoyés"
                 if failed > 0:
                     msg += f", {failed} échecs"
+                if error:
+                    msg += f" ({error})"
                 
                 self.after(0, lambda: self._log(f"✓ {msg}"))
                 self.after(0, self._refresh_local)
             except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
                 self.after(0, lambda: self._log(f"✗ Erreur distribution: {e}"))
+                self.after(0, lambda: self._log(f"  Traceback: {tb[:200]}..."))
         
         self._run_async(do_distribute())
     
@@ -453,21 +474,32 @@ Taille: {metadata.get('original_size', 0)} bytes"""
             port = self.app_gui.peer_port.get()
             
             self._log(f"Démarrage serveur P2P sur port {port}...")
+            self._log(f"  Network server existe: {hasattr(mgr, 'network_server') and mgr.network_server is not None}")
             
             # Le serveur est déjà créé dans le ChunkingManager si disponible
             if hasattr(mgr, 'network_server') and mgr.network_server:
                 async def start():
-                    await mgr.network_server.start("0.0.0.0", port)
-                    self.after(0, lambda: self._log(f"✓ Serveur démarré sur port {port}"))
-                    self.after(0, lambda: self.server_status_var.set(f"Serveur: Port {port}"))
+                    try:
+                        self.after(0, lambda: self._log(f"  Appel network_server.start(0.0.0.0, {port})..."))
+                        await mgr.network_server.start("0.0.0.0", port)
+                        self.after(0, lambda: self._log(f"✓ Serveur P2P démarré sur 0.0.0.0:{port}"))
+                        self.after(0, lambda: self._log(f"  Les autres clients peuvent maintenant envoyer des chunks"))
+                        self.after(0, lambda: self.server_status_var.set(f"Serveur: Port {port}"))
+                    except Exception as e:
+                        self.after(0, lambda: self._log(f"✗ Erreur dans start(): {e}"))
                 
                 self._run_async(start())
                 self._server_running = True
             else:
-                self._log("Serveur P2P non configuré dans ChunkingManager")
+                self._log("✗ Serveur P2P non configuré dans ChunkingManager")
+                self._log(f"  hasattr network_server: {hasattr(mgr, 'network_server')}")
+                if hasattr(mgr, 'network_server'):
+                    self._log(f"  network_server value: {mgr.network_server}")
                 
         except Exception as e:
+            import traceback
             self._log(f"✗ Erreur démarrage serveur: {e}")
+            self._log(f"  {traceback.format_exc()[:200]}")
     
     def _stop_server(self):
         """Arrête le serveur P2P."""

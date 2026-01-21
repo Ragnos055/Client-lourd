@@ -3,7 +3,6 @@ import json
 import time
 import threading
 
-stop_event = threading.Event()
 
 class connection:
 
@@ -14,6 +13,7 @@ class connection:
         self.peer_ip = peer_ip
         self.peer_port = peer_port
         self.keepalive_interval = keepalive_interval
+        self._stop_event = threading.Event()  # Event par instance
 
         # Effectue une annonce initiale et récupère les pairs,
         # puis démarre la boucle périodique dans un thread daemon.
@@ -24,15 +24,11 @@ class connection:
         self._thread.start()
 
     def close(self):
-        """Arrête proprement la boucle périodique.
-
-        Note: `stop_event` est global dans ce module, donc cela arrête
-        la boucle périodique côté module.
-        """
-        stop_event.set()
+        """Arrête proprement la boucle périodique de cette instance."""
+        self._stop_event.set()
         try:
             if hasattr(self, '_thread') and self._thread.is_alive():
-                self._thread.join(timeout=1)
+                self._thread.join(timeout=2)
         except Exception:
             pass
 
@@ -68,6 +64,10 @@ class connection:
 
 
     def periodic_announce(self):
-        while not stop_event.wait(self.keepalive_interval):
-            self.announce()
-            self.get_peers()
+        """Boucle de keepalive - annonce périodiquement le peer au tracker."""
+        while not self._stop_event.wait(self.keepalive_interval):
+            try:
+                self.announce()
+                self.get_peers()
+            except Exception as e:
+                print(f"Erreur dans periodic_announce: {e}")
