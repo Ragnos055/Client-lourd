@@ -95,6 +95,8 @@ class DecentralisGUI:
         os.makedirs(self.config_dir, exist_ok=True)
         self.storage_dir = os.path.join(self.config_dir, 'storage')
         os.makedirs(self.storage_dir, exist_ok=True)
+        # chemin pour persister l'identité du peer
+        self.peer_id_path = os.path.join(self.config_dir, 'peer_uuid.txt')
         # retention (key) file path
         self.retention_path = os.path.join(self.config_dir, 'key.json')
         # encryption settings object (cached for the session)
@@ -103,7 +105,7 @@ class DecentralisGUI:
         
         # Chunking P2P manager
         self.chunking_mgr = None
-        self._peer_uuid = str(uuid.uuid4())  # UUID unique pour ce peer
+        self._peer_uuid = self._load_or_create_peer_uuid()
         self._init_chunking()
 
         self.frames['peers'] = PeersView(container, self)
@@ -163,6 +165,46 @@ class DecentralisGUI:
         except Exception as e:
             print(f"Erreur initialisation chunking: {e}")
             self.chunking_mgr = None
+
+    def _load_or_create_peer_uuid(self) -> str:
+        """Charge un peer UUID persistant ou en crée un nouveau."""
+        # 1) Si un fichier persistant existe, le lire
+        if os.path.exists(self.peer_id_path):
+            try:
+                with open(self.peer_id_path, 'r', encoding='utf-8') as f:
+                    val = f.read().strip()
+                    if val:
+                        return val
+            except Exception:
+                pass
+
+        # 2) Sinon, tenter de réutiliser un dossier de chunks existant
+        chunks_dir = os.path.join(self.config_dir, 'chunks')
+        try:
+            if os.path.isdir(chunks_dir):
+                entries = [d for d in os.listdir(chunks_dir)
+                           if os.path.isdir(os.path.join(chunks_dir, d))]
+                if entries:
+                    existing = entries[0]
+                    # Valider vaguement le format UUID (presence des tirets)
+                    if '-' in existing:
+                        try:
+                            with open(self.peer_id_path, 'w', encoding='utf-8') as f:
+                                f.write(existing)
+                        except Exception:
+                            pass
+                        return existing
+        except Exception:
+            pass
+
+        # 3) Générer un nouvel UUID et le persister
+        new_uuid = str(uuid.uuid4())
+        try:
+            with open(self.peer_id_path, 'w', encoding='utf-8') as f:
+                f.write(new_uuid)
+        except Exception:
+            pass
+        return new_uuid
 
     def _check_and_restore_container(self):
         """
@@ -338,6 +380,14 @@ class DecentralisGUI:
                 if self.chunking_mgr and self.conn:
                     self.chunking_mgr.set_connection_handler(self.conn, peer_ip, peer_port)
                     print(f"[Chunking] Connection handler mis à jour: {peer_ip}:{peer_port}")
+                    
+                    # Démarrer le serveur P2P automatiquement
+                    try:
+                        p2p_view = self.frames.get('p2p') if hasattr(self, 'frames') else None
+                        if p2p_view and hasattr(p2p_view, '_start_server'):
+                            self.root.after(500, p2p_view._start_server)
+                    except Exception as e:
+                        print(f"[Erreur] Impossible de démarrer le serveur P2P: {e}")
             except Exception as e:
                 self.conn = None
                 self.root.after(0, lambda: messagebox.showerror("Erreur de connexion", str(e)))

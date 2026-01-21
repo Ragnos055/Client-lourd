@@ -13,6 +13,7 @@ Example:
 
 import sqlite3
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
@@ -63,6 +64,7 @@ class ChunkDatabase:
         self.logger = logger or logging.getLogger(__name__)
         self.conn: Optional[sqlite3.Connection] = None
         self._in_transaction = False
+        self._db_lock = threading.RLock()  # Verrou pour accès concurrent thread-safe
         
         try:
             # Créer le répertoire parent si nécessaire
@@ -70,11 +72,24 @@ class ChunkDatabase:
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             
             # Ouvrir la connexion
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            # Force DEFERRED isolation to keep an implicit transaction open and avoid
+            # autocommit edge cases when multiple threads share the same connection.
+            self.conn = sqlite3.connect(
+                db_path,
+                check_same_thread=False,
+                timeout=60,
+                isolation_level="DEFERRED",
+            )
             self.conn.row_factory = sqlite3.Row
             
             # Activer les foreign keys
             self.conn.execute("PRAGMA foreign_keys = ON")
+            
+            # Activer le mode WAL pour améliorer la concurrence d'écriture
+            # WAL permet à plusieurs threads d'écrire simultanément sans conflits
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")  # Balance perf/sécurité
+            self.conn.execute("PRAGMA busy_timeout = 60000")  # 60 secondes de retry
             
             # Créer les tables
             self._create_tables()
@@ -106,6 +121,7 @@ class ChunkDatabase:
                 file_uuid TEXT PRIMARY KEY,
                 owner_uuid TEXT NOT NULL,
                 original_filename TEXT,
+                file_path TEXT DEFAULT '',
                 original_hash TEXT,
                 original_size INTEGER DEFAULT 0,
                 total_chunks INTEGER DEFAULT 0,
@@ -229,6 +245,20 @@ class ChunkDatabase:
             )
         """)
         
+        # Table: stats_counter - Compteurs simples
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stats_counter (
+                counter_name TEXT PRIMARY KEY,
+                counter_value INTEGER DEFAULT 0
+            )
+        """)
+        
+        # Initialiser le compteur de chunks étrangers s'il n'existe pas
+        cursor.execute("""
+            INSERT OR IGNORE INTO stats_counter (counter_name, counter_value)
+            VALUES ('foreign_chunks_count', 0)
+        """)
+        
         # Index pour les requêtes fréquentes
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_chunks_file_owner 
@@ -276,30 +306,33 @@ class ChunkDatabase:
     
     def begin_transaction(self) -> None:
         """Démarre une transaction explicite."""
-        if self._in_transaction:
-            self.logger.warning("Transaction déjà en cours")
-            return
-        self.conn.execute("BEGIN TRANSACTION")
-        self._in_transaction = True
-        self.logger.debug("Transaction démarrée")
+        with self._db_lock:
+            if self._in_transaction:
+                self.logger.warning("Transaction déjà en cours")
+                return
+            self.conn.execute("BEGIN TRANSACTION")
+            self._in_transaction = True
+            self.logger.debug("Transaction démarrée")
     
     def commit(self) -> None:
         """Valide la transaction en cours."""
-        if not self._in_transaction:
-            self.logger.warning("Pas de transaction à valider")
-            return
-        self.conn.commit()
-        self._in_transaction = False
-        self.logger.debug("Transaction validée")
+        with self._db_lock:
+            if not self._in_transaction:
+                self.logger.warning("Pas de transaction à valider")
+                return
+            self.conn.commit()
+            self._in_transaction = False
+            self.logger.debug("Transaction validée")
     
     def rollback(self) -> None:
         """Annule la transaction en cours."""
-        if not self._in_transaction:
-            self.logger.warning("Pas de transaction à annuler")
-            return
-        self.conn.rollback()
-        self._in_transaction = False
-        self.logger.debug("Transaction annulée")
+        with self._db_lock:
+            if not self._in_transaction:
+                self.logger.warning("Pas de transaction à annuler")
+                return
+            self.conn.rollback()
+            self._in_transaction = False
+            self.logger.debug("Transaction annulée")
     
     @contextmanager
     def transaction(self):
@@ -335,35 +368,37 @@ class ChunkDatabase:
         """
         import json
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT INTO file_metadata (
-                    file_uuid, owner_uuid, original_filename, original_hash,
-                    original_size, total_chunks, data_chunks, parity_chunks,
-                    chunk_size, algorithm, local_groups_json,
-                    global_recovery_indices_json, chunk_hashes_json,
-                    created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                metadata.file_uuid,
-                metadata.owner_uuid,
-                metadata.original_filename,
-                metadata.original_hash,
-                metadata.original_size,
-                metadata.total_chunks,
-                metadata.data_chunks,
-                metadata.parity_chunks,
-                metadata.chunk_size,
-                metadata.algorithm,
-                json.dumps([g.to_dict() for g in metadata.local_groups]),
-                json.dumps(metadata.global_recovery_indices),
-                json.dumps(metadata.chunk_hashes),
-                metadata.created_at.isoformat() if metadata.created_at else None,
-                metadata.expires_at.isoformat() if metadata.expires_at else None,
-            ))
-            if not self._in_transaction:
-                self.conn.commit()
-            self.logger.debug(f"Métadonnées ajoutées: {metadata.file_uuid}")
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT INTO file_metadata (
+                        file_uuid, owner_uuid, original_filename, file_path, original_hash,
+                        original_size, total_chunks, data_chunks, parity_chunks,
+                        chunk_size, algorithm, local_groups_json,
+                        global_recovery_indices_json, chunk_hashes_json,
+                        created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    metadata.file_uuid,
+                    metadata.owner_uuid,
+                    metadata.original_filename,
+                    metadata.file_path,
+                    metadata.original_hash,
+                    metadata.original_size,
+                    metadata.total_chunks,
+                    metadata.data_chunks,
+                    metadata.parity_chunks,
+                    metadata.chunk_size,
+                    metadata.algorithm,
+                    json.dumps([g.to_dict() for g in metadata.local_groups]),
+                    json.dumps(metadata.global_recovery_indices),
+                    json.dumps(metadata.chunk_hashes),
+                    metadata.created_at.isoformat() if metadata.created_at else None,
+                    metadata.expires_at.isoformat() if metadata.expires_at else None,
+                ))
+                if not self._in_transaction:
+                    self.conn.commit()
+                self.logger.debug(f"Métadonnées ajoutées: {metadata.file_uuid}")
         except sqlite3.Error as e:
             raise ChunkDatabaseError(
                 "Failed to add file metadata",
@@ -419,6 +454,7 @@ class ChunkDatabase:
             file_uuid=row['file_uuid'],
             owner_uuid=row['owner_uuid'],
             original_filename=row['original_filename'] or '',
+            file_path=row['file_path'] if 'file_path' in row.keys() else '',
             original_hash=row['original_hash'] or '',
             original_size=row['original_size'] or 0,
             total_chunks=row['total_chunks'] or 0,
@@ -539,6 +575,88 @@ class ChunkDatabase:
             'files_count': files_count,
             'total_size_bytes': total_size,
         }
+
+    def get_foreign_chunks_stats(self, local_owner_uuid: str) -> Dict[str, Any]:
+        """
+        Récupère les stats des chunks hébergés pour d'autres propriétaires.
+        Utilise un compteur en BD pour performance.
+
+        Args:
+            local_owner_uuid: UUID du peer local (propriétaire de nos fichiers)
+
+        Returns:
+            {'count': int, 'total_size_bytes': int}
+        """
+        cursor = self.conn.cursor()
+        
+        # Lire le compteur depuis la BD
+        cursor.execute(
+            "SELECT counter_value FROM stats_counter WHERE counter_name = ?",
+            ('foreign_chunks_count',)
+        )
+        row = cursor.fetchone()
+        count = row['counter_value'] if row else 0
+        
+        # Recalculer la taille totale depuis les chunks
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(size_bytes), 0) as total_size
+            FROM chunks
+            WHERE owner_uuid != ?
+        """,
+            (local_owner_uuid,)
+        )
+        size_row = cursor.fetchone()
+        total_size = size_row['total_size'] if size_row else 0
+        
+        result = {
+            'count': count,
+            'total_size_bytes': total_size,
+        }
+        self.logger.debug(f"Foreign chunks stats (from counter): {result}")
+        return result
+    
+    def increment_foreign_chunks_counter(self, delta: int = 1) -> None:
+        """
+        Incrémente le compteur de chunks étrangers.
+        
+        Args:
+            delta: Nombre de chunks à ajouter (default 1)
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                UPDATE stats_counter 
+                SET counter_value = counter_value + ?
+                WHERE counter_name = ?
+            """,
+                (delta, 'foreign_chunks_count')
+            )
+            if not self._in_transaction:
+                self.conn.commit()
+            self.logger.debug(f"Foreign chunks counter incrémenté de {delta}")
+    
+    def decrement_foreign_chunks_counter(self, delta: int = 1) -> None:
+        """
+        Décrémente le compteur de chunks étrangers.
+        
+        Args:
+            delta: Nombre de chunks à retirer (default 1)
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                UPDATE stats_counter 
+                SET counter_value = MAX(0, counter_value - ?)
+                WHERE counter_name = ?
+            """,
+                (delta, 'foreign_chunks_count')
+            )
+            if not self._in_transaction:
+                self.conn.commit()
+            self.logger.debug(f"Foreign chunks counter décrémenté de {delta}")
     
     def delete_file_metadata(self, file_uuid: str) -> None:
         """
@@ -547,31 +665,32 @@ class ChunkDatabase:
         Args:
             file_uuid: UUID du fichier à supprimer
         """
-        cursor = self.conn.cursor()
-        
-        # Supprimer les chunks associés
-        cursor.execute("""
-            DELETE FROM chunks WHERE file_uuid = ?
-        """, (file_uuid,))
-        
-        # Supprimer les locations
-        cursor.execute("""
-            DELETE FROM chunk_locations WHERE file_uuid = ?
-        """, (file_uuid,))
-        
-        # Supprimer les assignments
-        cursor.execute("""
-            DELETE FROM chunk_assignments WHERE file_uuid = ?
-        """, (file_uuid,))
-        
-        # Supprimer les métadonnées
-        cursor.execute("""
-            DELETE FROM file_metadata WHERE file_uuid = ?
-        """, (file_uuid,))
-        
-        if not self._in_transaction:
-            self.conn.commit()
-        self.logger.debug(f"Fichier et chunks supprimés: {file_uuid}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            
+            # Supprimer les chunks associés
+            cursor.execute("""
+                DELETE FROM chunks WHERE file_uuid = ?
+            """, (file_uuid,))
+            
+            # Supprimer les locations
+            cursor.execute("""
+                DELETE FROM chunk_locations WHERE file_uuid = ?
+            """, (file_uuid,))
+            
+            # Supprimer les assignments
+            cursor.execute("""
+                DELETE FROM chunk_assignments WHERE file_uuid = ?
+            """, (file_uuid,))
+            
+            # Supprimer les métadonnées
+            cursor.execute("""
+                DELETE FROM file_metadata WHERE file_uuid = ?
+            """, (file_uuid,))
+            
+            if not self._in_transaction:
+                self.conn.commit()
+            self.logger.debug(f"Fichier et chunks supprimés: {file_uuid}")
     
     def get_file_by_uuid(self, file_uuid: str, owner_uuid: str) -> Optional[ChunkMetadata]:
         """
@@ -598,39 +717,40 @@ class ChunkDatabase:
         """
         import json
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                UPDATE file_metadata SET
-                    original_filename = ?,
-                    original_hash = ?,
-                    original_size = ?,
-                    total_chunks = ?,
-                    data_chunks = ?,
-                    parity_chunks = ?,
-                    chunk_size = ?,
-                    algorithm = ?,
-                    local_groups_json = ?,
-                    global_recovery_indices_json = ?,
-                    chunk_hashes_json = ?,
-                    expires_at = ?
-                WHERE file_uuid = ?
-            """, (
-                metadata.original_filename,
-                metadata.original_hash,
-                metadata.original_size,
-                metadata.total_chunks,
-                metadata.data_chunks,
-                metadata.parity_chunks,
-                metadata.chunk_size,
-                metadata.algorithm,
-                json.dumps([g.to_dict() for g in metadata.local_groups]),
-                json.dumps(metadata.global_recovery_indices),
-                json.dumps(metadata.chunk_hashes),
-                metadata.expires_at.isoformat() if metadata.expires_at else None,
-                metadata.file_uuid,
-            ))
-            if not self._in_transaction:
-                self.conn.commit()
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    UPDATE file_metadata SET
+                        original_filename = ?,
+                        original_hash = ?,
+                        original_size = ?,
+                        total_chunks = ?,
+                        data_chunks = ?,
+                        parity_chunks = ?,
+                        chunk_size = ?,
+                        algorithm = ?,
+                        local_groups_json = ?,
+                        global_recovery_indices_json = ?,
+                        chunk_hashes_json = ?,
+                        expires_at = ?
+                    WHERE file_uuid = ?
+                """, (
+                    metadata.original_filename,
+                    metadata.original_hash,
+                    metadata.original_size,
+                    metadata.total_chunks,
+                    metadata.data_chunks,
+                    metadata.parity_chunks,
+                    metadata.chunk_size,
+                    metadata.algorithm,
+                    json.dumps([g.to_dict() for g in metadata.local_groups]),
+                    json.dumps(metadata.global_recovery_indices),
+                    json.dumps(metadata.chunk_hashes),
+                    metadata.expires_at.isoformat() if metadata.expires_at else None,
+                    metadata.file_uuid,
+                ))
+                if not self._in_transaction:
+                    self.conn.commit()
         except sqlite3.Error as e:
             raise ChunkDatabaseError(
                 "Failed to update file metadata",
@@ -655,52 +775,53 @@ class ChunkDatabase:
         Raises:
             ChunkDatabaseError: Si l'insertion échoue
         """
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT INTO chunks (
-                    file_uuid, chunk_idx, owner_uuid, local_path,
-                    content_hash, chunk_type, size_bytes, stored_at,
-                    expires_at, last_accessed, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                stored_chunk.file_uuid,
-                stored_chunk.chunk_idx,
-                stored_chunk.owner_uuid,
-                stored_chunk.local_path,
-                stored_chunk.content_hash,
-                stored_chunk.chunk_type,
-                stored_chunk.size_bytes,
-                stored_chunk.stored_at.isoformat() if stored_chunk.stored_at else None,
-                stored_chunk.expires_at.isoformat() if stored_chunk.expires_at else None,
-                stored_chunk.last_accessed.isoformat() if stored_chunk.last_accessed else None,
-                stored_chunk.status,
-            ))
-            if not self._in_transaction:
-                self.conn.commit()
-            self.logger.debug(f"Chunk ajouté: {stored_chunk.file_uuid}#{stored_chunk.chunk_idx}")
-            return cursor.lastrowid
-        except sqlite3.IntegrityError:
-            # Le chunk existe déjà, on met à jour
-            self.update_chunk_status(
-                stored_chunk.file_uuid,
-                stored_chunk.chunk_idx,
-                stored_chunk.owner_uuid,
-                stored_chunk.status
-            )
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                SELECT id FROM chunks 
-                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
-            """, (stored_chunk.file_uuid, stored_chunk.chunk_idx, stored_chunk.owner_uuid))
-            row = cursor.fetchone()
-            return row['id'] if row else -1
-        except sqlite3.Error as e:
-            raise ChunkDatabaseError(
-                "Failed to add chunk",
-                {"file_uuid": stored_chunk.file_uuid, "chunk_idx": stored_chunk.chunk_idx},
-                sqlite_error=str(e)
-            )
+        with self._db_lock:  # Protéger contre accès concurrent
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT INTO chunks (
+                        file_uuid, chunk_idx, owner_uuid, local_path,
+                        content_hash, chunk_type, size_bytes, stored_at,
+                        expires_at, last_accessed, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    stored_chunk.file_uuid,
+                    stored_chunk.chunk_idx,
+                    stored_chunk.owner_uuid,
+                    stored_chunk.local_path,
+                    stored_chunk.content_hash,
+                    stored_chunk.chunk_type,
+                    stored_chunk.size_bytes,
+                    stored_chunk.stored_at.isoformat() if stored_chunk.stored_at else None,
+                    stored_chunk.expires_at.isoformat() if stored_chunk.expires_at else None,
+                    stored_chunk.last_accessed.isoformat() if stored_chunk.last_accessed else None,
+                    stored_chunk.status,
+                ))
+                if not self._in_transaction:
+                    self.conn.commit()
+                self.logger.debug(f"Chunk ajouté: {stored_chunk.file_uuid}#{stored_chunk.chunk_idx}")
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                # Le chunk existe déjà, on met à jour
+                self.update_chunk_status(
+                    stored_chunk.file_uuid,
+                    stored_chunk.chunk_idx,
+                    stored_chunk.owner_uuid,
+                    stored_chunk.status
+                )
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    SELECT id FROM chunks 
+                    WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
+                """, (stored_chunk.file_uuid, stored_chunk.chunk_idx, stored_chunk.owner_uuid))
+                row = cursor.fetchone()
+                return row['id'] if row else -1
+            except sqlite3.Error as e:
+                raise ChunkDatabaseError(
+                    "Failed to add chunk",
+                    {"file_uuid": stored_chunk.file_uuid, "chunk_idx": stored_chunk.chunk_idx},
+                    sqlite_error=str(e)
+                )
     
     def get_chunk(self, file_uuid: str, chunk_idx: int, owner_uuid: str) -> Optional[StoredChunk]:
         """
@@ -802,31 +923,39 @@ class ChunkDatabase:
             owner_uuid: UUID du propriétaire
             status: Nouveau statut ('verified', 'pending', 'corrupted')
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE chunks SET status = ?
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
-        """, (status, file_uuid, chunk_idx, owner_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE chunks SET status = ?
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
+            """, (status, file_uuid, chunk_idx, owner_uuid))
+            if not self._in_transaction:
+                self.conn.commit()
     
     def delete_chunk(self, file_uuid: str, chunk_idx: int, owner_uuid: str) -> None:
         """
         Supprime un chunk de la base.
+        Décrémente le compteur de chunks étrangers si applicable.
         
         Args:
             file_uuid: UUID du fichier
             chunk_idx: Index du chunk
             owner_uuid: UUID du propriétaire
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            DELETE FROM chunks 
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
-        """, (file_uuid, chunk_idx, owner_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
-        self.logger.debug(f"Chunk supprimé: {file_uuid}#{chunk_idx}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM chunks 
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
+            """, (file_uuid, chunk_idx, owner_uuid))
+            
+            # Décrémenter le compteur de chunks étrangers
+            # (Ce chunk n'était probablement pas à nous puisqu'il est supprimé)
+            self.decrement_foreign_chunks_counter(1)
+            
+            if not self._in_transaction:
+                self.conn.commit()
+            self.logger.debug(f"Chunk supprimé: {file_uuid}#{chunk_idx}")
     
     def get_expired_chunks(self) -> List[StoredChunk]:
         """
@@ -850,16 +979,17 @@ class ChunkDatabase:
         Returns:
             Nombre de chunks supprimés
         """
-        cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
-        cursor.execute("""
-            DELETE FROM chunks WHERE expires_at < ?
-        """, (now,))
-        count = cursor.rowcount
-        if not self._in_transaction:
-            self.conn.commit()
-        self.logger.info(f"Chunks expirés nettoyés: {count}")
-        return count
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            now = datetime.utcnow().isoformat()
+            cursor.execute("""
+                DELETE FROM chunks WHERE expires_at < ?
+            """, (now,))
+            count = cursor.rowcount
+            if not self._in_transaction:
+                self.conn.commit()
+            self.logger.info(f"Chunks expirés nettoyés: {count}")
+            return count
     
     def update_last_accessed(self, file_uuid: str, chunk_idx: int, owner_uuid: str) -> None:
         """
@@ -870,14 +1000,15 @@ class ChunkDatabase:
             chunk_idx: Index du chunk
             owner_uuid: UUID du propriétaire
         """
-        cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
-        cursor.execute("""
-            UPDATE chunks SET last_accessed = ?
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
-        """, (now, file_uuid, chunk_idx, owner_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            now = datetime.utcnow().isoformat()
+            cursor.execute("""
+                UPDATE chunks SET last_accessed = ?
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ?
+            """, (now, file_uuid, chunk_idx, owner_uuid))
+            if not self._in_transaction:
+                self.conn.commit()
     
     # ==========================================================================
     # CHUNK_LOCATIONS
@@ -894,26 +1025,27 @@ class ChunkDatabase:
             ID de la localisation
         """
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT INTO chunk_locations (
-                    file_uuid, chunk_idx, owner_uuid, peer_uuid,
-                    assigned_at, confirmed_at, status, attempts, failure_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                assignment.file_uuid,
-                assignment.chunk_idx,
-                assignment.owner_uuid,
-                assignment.peer_uuid,
-                assignment.assigned_at.isoformat() if assignment.assigned_at else None,
-                assignment.confirmed_at.isoformat() if assignment.confirmed_at else None,
-                assignment.status,
-                assignment.attempts,
-                assignment.failure_reason,
-            ))
-            if not self._in_transaction:
-                self.conn.commit()
-            return cursor.lastrowid
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT INTO chunk_locations (
+                        file_uuid, chunk_idx, owner_uuid, peer_uuid,
+                        assigned_at, confirmed_at, status, attempts, failure_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    assignment.file_uuid,
+                    assignment.chunk_idx,
+                    assignment.owner_uuid,
+                    assignment.peer_uuid,
+                    assignment.assigned_at.isoformat() if assignment.assigned_at else None,
+                    assignment.confirmed_at.isoformat() if assignment.confirmed_at else None,
+                    assignment.status,
+                    assignment.attempts,
+                    assignment.failure_reason,
+                ))
+                if not self._in_transaction:
+                    self.conn.commit()
+                return cursor.lastrowid
         except sqlite3.IntegrityError:
             # La localisation existe déjà, on met à jour
             self.update_location_status(
@@ -1026,13 +1158,14 @@ class ChunkDatabase:
             status: Nouveau statut
             failure_reason: Raison de l'échec optionnelle
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE chunk_locations SET status = ?, failure_reason = ?
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
-        """, (status, failure_reason, file_uuid, chunk_idx, owner_uuid, peer_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE chunk_locations SET status = ?, failure_reason = ?
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
+            """, (status, failure_reason, file_uuid, chunk_idx, owner_uuid, peer_uuid))
+            if not self._in_transaction:
+                self.conn.commit()
     
     def confirm_location(self, file_uuid: str, chunk_idx: int,
                         owner_uuid: str, peer_uuid: str) -> None:
@@ -1045,15 +1178,16 @@ class ChunkDatabase:
             owner_uuid: UUID du propriétaire
             peer_uuid: UUID du peer
         """
-        cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
-        cursor.execute("""
-            UPDATE chunk_locations 
-            SET status = 'confirmed', confirmed_at = ?
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
-        """, (now, file_uuid, chunk_idx, owner_uuid, peer_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            now = datetime.utcnow().isoformat()
+            cursor.execute("""
+                UPDATE chunk_locations 
+                SET status = 'confirmed', confirmed_at = ?
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
+            """, (now, file_uuid, chunk_idx, owner_uuid, peer_uuid))
+            if not self._in_transaction:
+                self.conn.commit()
     
     def get_pending_locations(self) -> List[ChunkAssignment]:
         """
@@ -1080,13 +1214,14 @@ class ChunkDatabase:
             owner_uuid: UUID du propriétaire
             peer_uuid: UUID du peer
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            DELETE FROM chunk_locations
-            WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
-        """, (file_uuid, chunk_idx, owner_uuid, peer_uuid))
-        if not self._in_transaction:
-            self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM chunk_locations
+                WHERE file_uuid = ? AND chunk_idx = ? AND owner_uuid = ? AND peer_uuid = ?
+            """, (file_uuid, chunk_idx, owner_uuid, peer_uuid))
+            if not self._in_transaction:
+                self.conn.commit()
     
     # ==========================================================================
     # REPLICATION_HISTORY
@@ -1103,29 +1238,30 @@ class ChunkDatabase:
             ID de la tâche
         """
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT INTO replication_history (
-                    file_uuid, chunk_idx, owner_uuid, source_peer_uuid,
-                    target_peer_uuid, reason, created_at, completed_at,
-                    attempts, status, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                task.file_uuid,
-                task.chunk_idx,
-                task.owner_uuid,
-                task.source_peer_uuid,
-                task.target_peer_uuid,
-                task.reason,
-                task.created_at.isoformat() if task.created_at else None,
-                task.completed_at.isoformat() if task.completed_at else None,
-                task.attempts,
-                task.status,
-                task.error_message,
-            ))
-            if not self._in_transaction:
-                self.conn.commit()
-            return cursor.lastrowid
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    INSERT INTO replication_history (
+                        file_uuid, chunk_idx, owner_uuid, source_peer_uuid,
+                        target_peer_uuid, reason, created_at, completed_at,
+                        attempts, status, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    task.file_uuid,
+                    task.chunk_idx,
+                    task.owner_uuid,
+                    task.source_peer_uuid,
+                    task.target_peer_uuid,
+                    task.reason,
+                    task.created_at.isoformat() if task.created_at else None,
+                    task.completed_at.isoformat() if task.completed_at else None,
+                    task.attempts,
+                    task.status,
+                    task.error_message,
+                ))
+                if not self._in_transaction:
+                    self.conn.commit()
+                return cursor.lastrowid
         except sqlite3.Error as e:
             raise ChunkDatabaseError(
                 "Failed to add replication task",

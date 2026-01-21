@@ -104,6 +104,7 @@ class ChunkingManager:
         self.peer_uuid = peer_uuid
         self.storage_dir = os.path.abspath(os.path.expanduser(storage_dir))
         self.db_path = os.path.abspath(os.path.expanduser(db_path))
+        self._distribution_locks: Dict[str, asyncio.Lock] = {}
         self.config = config or get_config()
         self.logger = logger or logging.getLogger(__name__)
         self.connection_handler = connection_handler
@@ -187,10 +188,16 @@ class ChunkingManager:
     # CHUNKING DE FICHIERS
     # ==========================================================================
     
-    async def chunk_file(self, file_path: str, owner_uuid: str) -> str:
+    async def chunk_file(
+        self,
+        file_path: str,
+        owner_uuid: str,
+        file_logical_path: str = None,
+        delete_source_after: bool = False
+    ) -> str:
         """
         Découpe un fichier en chunks avec Reed-Solomon + LRC.
-        
+
         Cette méthode:
         1. Lit le fichier et calcule son hash
         2. Découpe les données en K chunks de données
@@ -198,19 +205,24 @@ class ChunkingManager:
         4. Crée les groupes locaux LRC et leurs symboles de récupération
         5. Stocke les chunks localement
         6. Enregistre les métadonnées en base
-        
+        7. Optionnellement supprime le fichier source
+
         Args:
             file_path: Chemin du fichier à chunker (ex: container.dat)
             owner_uuid: UUID du propriétaire du fichier
-            
+            file_logical_path: Chemin logique du fichier (ex: dossier/sub/file.txt)
+                              Si None, utilise le basename de file_path
+            delete_source_after: Si True, supprime le fichier source après
+                                 un chunking réussi
+
         Returns:
             file_uuid: UUID unique généré pour ce fichier chunké
-            
+
         Raises:
             ChunkEncodingError: Si l'encodage échoue
             ChunkStorageError: Si le stockage échoue
             FileNotFoundError: Si le fichier source n'existe pas
-            
+
         Example:
             >>> import asyncio
             >>> async def example():
@@ -233,6 +245,10 @@ class ChunkingManager:
             original_size = len(file_data)
             original_hash = hashlib.sha256(file_data).hexdigest()
             original_filename = os.path.basename(file_path)
+            
+            # Utiliser le chemin logique fourni ou générer depuis le basename
+            if file_logical_path is None:
+                file_logical_path = original_filename
             
             self.logger.debug(
                 f"Fichier lu: {original_size} bytes, hash={original_hash[:16]}..."
@@ -283,6 +299,7 @@ class ChunkingManager:
                 file_uuid=file_uuid,
                 owner_uuid=owner_uuid,
                 original_filename=original_filename,
+                file_path=file_logical_path,
                 original_hash=original_hash,
                 original_size=original_size,
                 total_chunks=len(all_chunks),
@@ -296,6 +313,7 @@ class ChunkingManager:
             )
             
             # Stocker les chunks localement
+            # Note: chaque opération DB fait son propre commit, protégé par RLock
             for i, chunk_data in enumerate(all_chunks):
                 # Déterminer le type de chunk
                 if i < len(data_chunks):
@@ -325,14 +343,26 @@ class ChunkingManager:
             # Stocker les métadonnées
             self.store.store_metadata(owner_uuid, file_uuid, metadata)
             self.db.add_file_metadata(metadata)
-            
+
             self.logger.info(
                 f"Chunking terminé: file_uuid={file_uuid}, "
                 f"{len(all_chunks)} chunks créés"
             )
-            
+
+            # Supprimer le fichier source si demandé
+            if delete_source_after:
+                try:
+                    os.remove(file_path)
+                    self.logger.info(
+                        f"Fichier source supprimé après chunking: {file_path}"
+                    )
+                except OSError as del_err:
+                    self.logger.warning(
+                        f"Impossible de supprimer le fichier source: {del_err}"
+                    )
+
             return file_uuid
-            
+
         except Exception as e:
             if isinstance(e, (ChunkEncodingError, ChunkStorageError)):
                 raise
@@ -349,139 +379,255 @@ class ChunkingManager:
         self,
         file_uuid: str,
         owner_uuid: str,
-        exclude_local: bool = True
+        exclude_local: bool = True,
+        delete_local_after_confirm: bool = True
     ) -> Dict[str, Any]:
         """
         Distribue les chunks d'un fichier vers les peers du réseau.
-        
+
         Cette méthode:
-        1. Récupère la liste des peers fiables
-        2. Assigne les chunks aux peers (round-robin)
-        3. Envoie les chunks via RPC
-        4. Enregistre les localisations en base
-        
+        1. Vérifie que le serveur réseau est actif
+        2. Récupère la liste des peers fiables
+        3. Assigne les chunks aux peers (round-robin)
+        4. Envoie les chunks via RPC avec retry
+        5. Enregistre les localisations en base
+        6. Supprime les chunks locaux après confirmation (si demandé)
+
         Args:
             file_uuid: UUID du fichier à distribuer
             owner_uuid: UUID du propriétaire
             exclude_local: Exclure les chunks locaux de la distribution
-            
+            delete_local_after_confirm: Supprimer les chunks locaux après
+                                        confirmation par le peer distant
+
         Returns:
             Rapport de distribution:
             {
                 'total_chunks': int,
                 'distributed': int,
                 'failed': int,
+                'local_deleted': int,
                 'assignments': List[dict]
             }
-            
+
         Raises:
             FileMetadataNotFoundError: Si les métadonnées n'existent pas
             PeerCommunicationError: Si la communication échoue
         """
-        # Récupérer les métadonnées
-        metadata = self.db.get_file_metadata(file_uuid)
-        if not metadata:
-            raise FileMetadataNotFoundError(
-                f"File metadata not found: {file_uuid}",
-                {"file_uuid": file_uuid}
-            )
-        
-        self.logger.info(f"Distribution des chunks: {file_uuid}")
-        
-        # Récupérer les peers disponibles
-        peers = await self._get_available_peers(exclude_self=True)
-        
-        if not peers:
-            self.logger.warning("Aucun peer disponible pour la distribution")
+        # Empêcher les distributions concurrentes sur le même fichier
+        lock = self._distribution_locks.setdefault(file_uuid, asyncio.Lock())
+        if lock.locked():
+            self.logger.info(f"Distribution déjà en cours pour {file_uuid}, on ignore la requête")
             return {
-                'total_chunks': metadata.total_chunks,
+                'total_chunks': 0,
                 'distributed': 0,
                 'failed': 0,
                 'assignments': [],
-                'error': 'No peers available'
+                'error': 'distribution_in_progress'
             }
+
+        try:
+            self.logger.info(f">>> DEBUT distribute_chunks pour {file_uuid}")
+        except Exception as e:
+            self.logger.error(f"Erreur logging debut: {e}")
         
-        # Préparer les chunks à distribuer
-        chunks_to_distribute = list(range(metadata.total_chunks))
-        
-        # Assigner les chunks aux peers (round-robin)
-        assignments = []
-        peer_index = 0
-        
-        for chunk_idx in chunks_to_distribute:
-            peer = peers[peer_index % len(peers)]
+        async with lock:
+            # Vérifier que le serveur réseau est actif
+            if self.network_server and not self.network_server._running:
+                self.logger.warning(
+                    "Le serveur réseau n'est pas démarré. "
+                    "Les autres peers ne pourront pas nous contacter."
+                )
+                # On continue quand même, mais on log l'avertissement
+
+            # Vérifier que PeerRPC est configuré
+            if self.peer_rpc is None:
+                self.logger.error("PeerRPC non configuré, distribution impossible")
+                return {
+                    'total_chunks': 0,
+                    'distributed': 0,
+                    'failed': 0,
+                    'assignments': [],
+                    'error': 'PeerRPC not configured'
+                }
+
+            # Récupérer les métadonnées
+            metadata = self.db.get_file_metadata(file_uuid)
+            if not metadata:
+                raise FileMetadataNotFoundError(
+                    f"File metadata not found: {file_uuid}",
+                    {"file_uuid": file_uuid}
+                )
             
-            assignment = ChunkAssignment(
-                file_uuid=file_uuid,
-                chunk_idx=chunk_idx,
-                owner_uuid=owner_uuid,
-                peer_uuid=peer['uuid'],
+            # Vérifier qu'il existe au moins un chunk local avant de distribuer
+            local_chunks = self.db.list_chunks_by_file(file_uuid, owner_uuid)
+            if not local_chunks:
+                self.logger.warning(
+                    f"Aucun chunk local trouvé pour {file_uuid}, distribution annulée. "
+                    "Les chunks ont peut-être déjà été distribués."
+                )
+                return {
+                    'total_chunks': metadata.total_chunks,
+                    'distributed': 0,
+                    'failed': 0,
+                    'local_deleted': 0,
+                    'assignments': [],
+                    'error': 'no_local_chunks'
+                }
+
+            self.logger.info(f"Distribution des chunks: {file_uuid}")
+
+            # Récupérer les peers disponibles
+            peers = await self._get_available_peers(exclude_self=True)
+
+            if not peers:
+                self.logger.warning("Aucun peer disponible pour la distribution")
+                return {
+                    'total_chunks': metadata.total_chunks,
+                    'distributed': 0,
+                    'failed': 0,
+                    'assignments': [],
+                    'error': 'No peers available'
+                }
+
+            # Préparer les chunks à distribuer avec logique optimale
+            chunks_to_distribute = list(range(metadata.total_chunks))
+
+            self.logger.info(f">>> chunks_to_distribute créé: {len(chunks_to_distribute)} chunks")
+
+            # Logique de distribution:
+            # - Si chunks <= peers: 1 chunk par peer (optimal)
+            # - Si chunks > peers: Round-robin sur tous les peers disponibles
+
+            assignments = []
+
+            # Toujours utiliser round-robin pour éviter IndexError
+            self.logger.info(
+                f"Distribution: {len(chunks_to_distribute)} chunks sur "
+                f"{len(peers)} peer(s)"
             )
-            assignments.append(assignment)
-            
-            peer_index += 1
-        
-        # Distribuer les chunks
-        distributed = 0
-        failed = 0
-        results = []
-        
-        for assignment in assignments:
-            try:
-                # Récupérer les données du chunk
-                chunk_data = self.store.get_chunk(
-                    owner_uuid, file_uuid, assignment.chunk_idx
+
+            self.logger.info(f">>> Début boucle création assignments...")
+
+            for peer_index, chunk_idx in enumerate(chunks_to_distribute):
+                # Utiliser round-robin pour distribuer sur tous les peers disponibles
+                peer = peers[peer_index % len(peers)]
+
+                self.logger.info(f">>> Création assignment {peer_index}: chunk {chunk_idx} -> peer {peer.get('uuid', 'unknown')[:16]}")
+
+                assignment = ChunkAssignment(
+                    file_uuid=file_uuid,
+                    chunk_idx=chunk_idx,
+                    owner_uuid=owner_uuid,
+                    peer_uuid=peer['uuid'],
                 )
-                
-                if chunk_data is None:
-                    self.logger.error(
-                        f"Chunk non trouvé localement: {file_uuid}#{assignment.chunk_idx}"
+                assignments.append(assignment)
+                self.logger.debug(
+                    f"Chunk {chunk_idx} -> Peer {peer['uuid']}"
+                )
+
+            self.logger.info(f">>> Assignments créés: {len(assignments)}")
+
+            # Distribuer les chunks
+            distributed = 0
+            failed = 0
+            local_deleted = 0
+            results = []
+
+            self.logger.info(f"Début distribution de {len(assignments)} chunks...")
+
+            for i, assignment in enumerate(assignments):
+                self.logger.info(
+                    f"[{i+1}/{len(assignments)}] Traitement chunk {assignment.chunk_idx} "
+                    f"vers {assignment.peer_uuid}..."
+                )
+                try:
+                    # Récupérer les données du chunk
+                    chunk_data = self.store.get_chunk(
+                        owner_uuid, file_uuid, assignment.chunk_idx
                     )
-                    assignment.mark_failed("Chunk not found locally")
+
+                    if chunk_data is None:
+                        self.logger.error(
+                            f"Chunk non trouvé localement: {file_uuid}#{assignment.chunk_idx}"
+                        )
+                        assignment.mark_failed("Chunk not found locally")
+                        failed += 1
+                        continue
+
+                    self.logger.info(
+                        f"  Chunk {assignment.chunk_idx} lu ({len(chunk_data)} bytes), "
+                        f"envoi vers {assignment.peer_uuid}..."
+                    )
+
+                    # Envoyer au peer
+                    success = await self._send_chunk_to_peer(
+                        assignment.peer_uuid,
+                        file_uuid,
+                        assignment.chunk_idx,
+                        owner_uuid,
+                        chunk_data,
+                        metadata.chunk_hashes.get(assignment.chunk_idx, '')
+                    )
+
+                    self.logger.info(f"  Résultat envoi chunk {assignment.chunk_idx}: {success}")
+
+                    if success:
+                        assignment.mark_confirmed()
+                        distributed += 1
+
+                        # Supprimer le chunk local après confirmation du peer distant
+                        # Le peer distant a validé le checksum et confirmé le stockage
+                        if delete_local_after_confirm:
+                            try:
+                                # Supprimer du disque
+                                deleted = self.store.delete_chunk(
+                                    owner_uuid, file_uuid, assignment.chunk_idx
+                                )
+                                if deleted:
+                                    # Supprimer aussi de la base de données
+                                    self.db.delete_chunk(
+                                        file_uuid, assignment.chunk_idx, owner_uuid
+                                    )
+                                    local_deleted += 1
+                                    self.logger.info(
+                                        f"Chunk local supprimé après confirmation: "
+                                        f"{file_uuid}#{assignment.chunk_idx}"
+                                    )
+                            except Exception as del_err:
+                                self.logger.warning(
+                                    f"Erreur suppression chunk local {assignment.chunk_idx}: "
+                                    f"{del_err}"
+                                )
+                    else:
+                        assignment.mark_failed("Transfer failed")
+                        failed += 1
+
+                    # Enregistrer l'assignation
+                    self.db.add_location(assignment)
+                    results.append(assignment.to_dict())
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Erreur distribution chunk {assignment.chunk_idx}: {e}"
+                    )
+                    assignment.mark_failed(str(e))
                     failed += 1
-                    continue
-                
-                # Envoyer au peer
-                success = await self._send_chunk_to_peer(
-                    assignment.peer_uuid,
-                    file_uuid,
-                    assignment.chunk_idx,
-                    owner_uuid,
-                    chunk_data,
-                    metadata.chunk_hashes.get(assignment.chunk_idx, '')
-                )
-                
-                if success:
-                    assignment.mark_confirmed()
-                    distributed += 1
-                else:
-                    assignment.mark_failed("Transfer failed")
-                    failed += 1
-                
-                # Enregistrer l'assignation
-                self.db.add_location(assignment)
-                results.append(assignment.to_dict())
-                
-            except Exception as e:
-                self.logger.error(
-                    f"Erreur distribution chunk {assignment.chunk_idx}: {e}"
-                )
-                assignment.mark_failed(str(e))
-                failed += 1
-                self.db.add_location(assignment)
-                results.append(assignment.to_dict())
-        
-        self.logger.info(
-            f"Distribution terminée: {distributed}/{len(assignments)} réussis, "
-            f"{failed} échecs"
-        )
-        
-        return {
-            'total_chunks': metadata.total_chunks,
-            'distributed': distributed,
-            'failed': failed,
-            'assignments': results,
-        }
+                    self.db.add_location(assignment)
+                    results.append(assignment.to_dict())
+
+            self.logger.info(
+                f"Distribution terminée: {distributed}/{len(assignments)} réussis, "
+                f"{failed} échecs, {local_deleted} chunks locaux supprimés"
+            )
+
+            return {
+                'total_chunks': metadata.total_chunks,
+                'distributed': distributed,
+                'failed': failed,
+                'local_deleted': local_deleted,
+                'assignments': results,
+            }
     
     async def _send_chunk_to_peer(
         self,
@@ -490,11 +636,12 @@ class ChunkingManager:
         chunk_idx: int,
         owner_uuid: str,
         chunk_data: bytes,
-        content_hash: str
+        content_hash: str,
+        max_retries: int = None
     ) -> bool:
         """
-        Envoie un chunk à un peer via RPC.
-        
+        Envoie un chunk à un peer via RPC avec retry.
+
         Args:
             peer_uuid: UUID du peer destinataire
             file_uuid: UUID du fichier
@@ -502,40 +649,87 @@ class ChunkingManager:
             owner_uuid: UUID du propriétaire
             chunk_data: Données du chunk
             content_hash: Hash du contenu
-            
+            max_retries: Nombre max de retries (défaut: config)
+
         Returns:
             True si l'envoi a réussi
         """
         if self.peer_rpc is None:
-            self.logger.warning(
+            self.logger.error(
                 f"PeerRPC non configuré, chunk {chunk_idx} non envoyé"
             )
             return False
-        
-        try:
-            self.logger.info(f"Envoi chunk {chunk_idx} vers {peer_uuid}...")
-            
-            # Utiliser le client RPC pour envoyer
-            result = await self.peer_rpc.store_chunk(
-                peer_uuid=peer_uuid,
-                file_uuid=file_uuid,
-                chunk_idx=chunk_idx,
-                owner_uuid=owner_uuid,
-                chunk_data=chunk_data,
-                content_hash=content_hash
-            )
-            
-            success = result.get('success', False)
-            if success:
-                self.logger.info(f"✓ Chunk {chunk_idx} envoyé à {peer_uuid}")
-            else:
-                self.logger.warning(f"✗ Échec envoi chunk {chunk_idx} à {peer_uuid}: {result}")
-            
-            return success
-            
-        except Exception as e:
-            self.logger.error(f"Erreur envoi chunk {chunk_idx} à {peer_uuid}: {e}")
-            return False
+
+        # Utiliser les paramètres de config
+        if max_retries is None:
+            max_retries = self.config.get('REPLICATION', {}).get('MAX_RETRIES', 3)
+        retry_delay = self.config.get('REPLICATION', {}).get('RETRY_DELAY_SECONDS', 5)
+
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    # Attendre avant de réessayer avec backoff exponentiel
+                    wait_time = retry_delay * (2 ** (attempt - 1))
+                    self.logger.info(
+                        f"Retry {attempt}/{max_retries} pour chunk {chunk_idx} "
+                        f"vers {peer_uuid} dans {wait_time}s..."
+                    )
+                    await asyncio.sleep(wait_time)
+
+                # Vérifier la résolution du peer
+                peer_addr = self._peer_address_map.get(peer_uuid)
+                if peer_addr is None:
+                    # Essayer de résoudre via le cache du peer_rpc
+                    peer_addr = self.peer_rpc.get_cached_address(peer_uuid)
+                
+                if peer_addr:
+                    addr_str = f" at {peer_addr[0]}:{peer_addr[1]}"
+                else:
+                    addr_str = " (address unresolved)"
+                
+                self.logger.info(
+                    f"Envoi chunk {chunk_idx} vers {peer_uuid}{addr_str} "
+                    f"(tentative {attempt + 1}/{max_retries + 1}, {len(chunk_data)} bytes)..."
+                )
+
+                # Utiliser le client RPC pour envoyer
+                result = await self.peer_rpc.store_chunk(
+                    peer_uuid=peer_uuid,
+                    file_uuid=file_uuid,
+                    chunk_idx=chunk_idx,
+                    owner_uuid=owner_uuid,
+                    chunk_data=chunk_data,
+                    content_hash=content_hash
+                )
+
+                success = result.get('success', False)
+                if success:
+                    self.logger.info(f"✓ Chunk {chunk_idx} envoyé et stocké sur {peer_uuid}")
+                    return True
+                else:
+                    last_error = f"Server returned: {result}"
+                    self.logger.warning(
+                        f"✗ Échec envoi chunk {chunk_idx} à {peer_uuid}: {result} "
+                        f"(tentative {attempt + 1}/{max_retries + 1})"
+                    )
+
+            except Exception as e:
+                last_error = str(e)
+                addr_str_err = f" at {peer_addr[0]}:{peer_addr[1]}" if 'peer_addr' in locals() and peer_addr else " (address unresolved)"
+                self.logger.error(
+                    f"Erreur envoi chunk {chunk_idx} à {peer_uuid}{addr_str_err}: "
+                    f"{type(e).__name__}: {e} "
+                    f"(tentative {attempt + 1}/{max_retries + 1})"
+                )
+
+        # Tous les retries ont échoué
+        self.logger.error(
+            f"✗ Échec définitif envoi chunk {chunk_idx} à {peer_uuid} "
+            f"après {max_retries + 1} tentatives. Dernière erreur: {last_error}"
+        )
+        return False
     
     async def _get_available_peers(
         self,
@@ -590,7 +784,12 @@ class ChunkingManager:
                     
                     # Stocker dans le mapping pour la résolution
                     self._peer_address_map[peer_uuid] = (ip, port)
-                    self.logger.info(f"Peer ajouté au mapping: {peer_uuid} -> ({ip}, {port})")
+
+                    # Mettre à jour aussi le cache du PeerRPC
+                    if self.peer_rpc:
+                        self.peer_rpc.update_peer_address(peer_uuid, ip, port)
+
+                    self.logger.debug(f"Peer ajouté au mapping: {peer_uuid} -> ({ip}, {port})")
                     
                 self.logger.debug(f"Peers récupérés du tracker: {len(peers)}")
             except Exception as e:
@@ -606,6 +805,9 @@ class ChunkingManager:
                 port = peer.get('port')
                 if peer_uuid and ip and port:
                     self._peer_address_map[peer_uuid] = (ip, port)
+                    # Mettre à jour aussi le cache du PeerRPC
+                    if self.peer_rpc:
+                        self.peer_rpc.update_peer_address(peer_uuid, ip, port)
         
         # Filtrer
         filtered = []
@@ -637,7 +839,7 @@ class ChunkingManager:
     async def reconstruct_file(
         self,
         file_uuid: str,
-        owner_uuid: str,
+        owner_uuid: Optional[str] = None,
         output_path: Optional[str] = None
     ) -> bytes:
         """
@@ -665,8 +867,8 @@ class ChunkingManager:
         """
         # Récupérer les métadonnées
         metadata = self.db.get_file_metadata(file_uuid)
-        if not metadata:
-            # Essayer depuis le disque
+        if not metadata and owner_uuid:
+            # Essayer depuis le disque avec l'owner fourni
             metadata = self.store.get_metadata(owner_uuid, file_uuid)
         
         if not metadata:
@@ -674,6 +876,9 @@ class ChunkingManager:
                 f"File metadata not found: {file_uuid}",
                 {"file_uuid": file_uuid}
             )
+
+        # Utiliser l'owner présent dans les métadonnées si non fourni
+        effective_owner_uuid = owner_uuid or metadata.owner_uuid
         
         self.logger.info(
             f"Reconstruction fichier: {file_uuid} "
@@ -686,7 +891,7 @@ class ChunkingManager:
         
         # 1. Chunks locaux
         for chunk_idx in range(metadata.total_chunks):
-            chunk_data = self.store.get_chunk(owner_uuid, file_uuid, chunk_idx)
+            chunk_data = self.store.get_chunk(effective_owner_uuid, file_uuid, chunk_idx)
             if chunk_data:
                 # Vérifier le hash
                 expected_hash = metadata.chunk_hashes.get(chunk_idx)
@@ -713,7 +918,7 @@ class ChunkingManager:
         # 2. Chunks depuis le réseau si nécessaire
         if len(available_chunks) < metadata.data_chunks:
             network_chunks = await self._fetch_chunks_from_network(
-                file_uuid, owner_uuid, metadata,
+                file_uuid, effective_owner_uuid, metadata,
                 needed_count=metadata.data_chunks - len(available_chunks),
                 exclude_indices=set(available_chunks.keys())
             )

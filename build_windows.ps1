@@ -18,8 +18,13 @@ Write-Host "Activating virtualenv and installing requirements..."
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
+Write-Host "Cleaning PyInstaller cache..."
+if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
+if (Test-Path "$Name.spec") { Remove-Item -Force "$Name.spec" }
+
 Write-Host "Running PyInstaller..."
-pyinstaller --onefile --windowed --name $Name --icon .\assets\icon.ico --distpath $OutDir $Entry
+pyinstaller --onefile --name $Name --icon .\assets\icon.ico --distpath $OutDir $Entry
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build réussi. Fichier généré dans: $OutDir\$Name.exe"

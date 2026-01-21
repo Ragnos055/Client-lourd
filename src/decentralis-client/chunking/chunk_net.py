@@ -74,7 +74,8 @@ class ChunkNetworkServer:
         chunk_db: ChunkDatabase,
         own_public_key_pem: Optional[str] = None,
         peer_key_resolver: Optional[Callable[[str], str]] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        on_chunk_stored: Optional[Callable] = None
     ):
         """
         Initialise le serveur réseau.
@@ -86,6 +87,7 @@ class ChunkNetworkServer:
             own_public_key_pem: Clé publique de ce peer (pour vérification)
             peer_key_resolver: Fonction pour résoudre UUID -> clé publique
             logger: Logger optionnel
+            on_chunk_stored: Callback optionnel appelé quand un chunk est stocké
         """
         self.own_uuid = own_uuid
         self.chunk_store = chunk_store
@@ -94,12 +96,14 @@ class ChunkNetworkServer:
         self.peer_key_resolver = peer_key_resolver
         self.logger = logger or logging.getLogger(__name__)
         self.config = CHUNKING_CONFIG['NETWORK']
+        self.on_chunk_stored = on_chunk_stored
         
         # État du serveur
         self._server: Optional[asyncio.Server] = None
         self._active_connections: Set[asyncio.Task] = set()
         self._running = False
         self._start_time: Optional[datetime] = None
+        self._serve_task: Optional[asyncio.Task] = None  # Garder la tâche serve_forever en vie
         
         # Méthodes RPC disponibles
         self._rpc_methods = {
@@ -149,8 +153,9 @@ class ChunkNetworkServer:
             self.logger.info(f"[SERVER] ✓ Serveur TCP démarré sur {addr[0]}:{addr[1]}")
             self.logger.info(f"[SERVER] En attente de connexions entrantes...")
             
-            # Lancer la boucle de service en arrière-plan
-            asyncio.create_task(self._server.serve_forever())
+            # Lancer la boucle de service en arrière-plan et garder une référence
+            self._serve_task = asyncio.create_task(self._server.serve_forever())
+            self.logger.debug(f"[SERVER] Tâche serve_forever créée: {self._serve_task}")
             
         except OSError as e:
             self.logger.error(f"[SERVER] ✗ Impossible de démarrer le serveur: {e}")
@@ -173,6 +178,14 @@ class ChunkNetworkServer:
         # Attendre la fin des connexions
         if self._active_connections:
             await asyncio.gather(*self._active_connections, return_exceptions=True)
+        
+        # Annuler la tâche serve_forever
+        if self._serve_task and not self._serve_task.done():
+            self._serve_task.cancel()
+            try:
+                await self._serve_task
+            except asyncio.CancelledError:
+                pass
         
         # Fermer le serveur
         if self._server:
@@ -234,10 +247,21 @@ class ChunkNetworkServer:
                         )
                         break
                     
-                    # Lire le message
+                    # Calculer un timeout adaptatif basé sur la taille du message
+                    # pour éviter les timeouts lors de la réception de gros chunks
+                    base_timeout = self.config['RPC_TIMEOUT_SECONDS']
+                    bytes_per_second = 1024 * 1024  # Estimé 1 MB/s
+                    transfer_time = (message_length / bytes_per_second) * 2  # Avec marge x2
+                    adaptive_timeout = max(base_timeout, transfer_time + 10)  # +10s overhead
+                    
+                    self.logger.debug(
+                        f"[SERVER] Timeout adaptatif: {adaptive_timeout}s pour {message_length} bytes"
+                    )
+                    
+                    # Lire le message avec timeout adaptatif
                     message_bytes = await asyncio.wait_for(
                         reader.readexactly(message_length),
-                        timeout=self.config['RPC_TIMEOUT_SECONDS']
+                        timeout=adaptive_timeout
                     )
                     
                     # Parser la requête
@@ -433,10 +457,14 @@ class ChunkNetworkServer:
         Returns:
             {'success': bool, 'stored_at': str, 'expires_at': str}
         """
+        self.logger.info(f"[HANDLER] >>> _handle_store_chunk APPELÉ!")
+        
         # Extraire les paramètres
         file_uuid = params['file_uuid']
         chunk_idx = params['chunk_idx']
         owner_uuid = params['owner_uuid']
+        
+        self.logger.info(f"[HANDLER] >>> Stockage: {file_uuid}#{chunk_idx} du propriétaire {owner_uuid[:16]}")
         chunk_data = base64.b64decode(params['chunk_data_b64'])
         content_hash = params['content_hash']
         
@@ -451,24 +479,41 @@ class ChunkNetworkServer:
         
         # Stocker le chunk
         stored_at = datetime.utcnow()
-        retention_days = CHUNKING_CONFIG['RETENTION_DAYS']
+        retention_days = CHUNKING_CONFIG['RETENTION']['DAYS']
         expires_at = stored_at + timedelta(days=retention_days)
-        
-        stored_chunk = StoredChunk(
-            file_uuid=file_uuid,
-            chunk_idx=chunk_idx,
-            owner_uuid=owner_uuid,
-            content_hash=content_hash,
-            size_bytes=len(chunk_data),
-            stored_at=stored_at,
-            expires_at=expires_at,
-        )
-        
-        # Sauvegarder
-        await asyncio.to_thread(
+
+        # Sauvegarder le chunk sur disque et récupérer le chemin local
+        # La signature de store_chunk est: (owner_uuid, file_uuid, chunk_idx, chunk_data)
+        local_path = await asyncio.to_thread(
             self.chunk_store.store_chunk,
-            chunk_data, stored_chunk
+            owner_uuid, file_uuid, chunk_idx, chunk_data
         )
+
+        # Enregistrer les métadonnées dans la base de données si disponible
+        if self.chunk_db:
+            stored_chunk = StoredChunk(
+                file_uuid=file_uuid,
+                chunk_idx=chunk_idx,
+                owner_uuid=owner_uuid,
+                                local_path=local_path,
+                content_hash=content_hash,
+                size_bytes=len(chunk_data),
+                stored_at=stored_at,
+                expires_at=expires_at,
+            )
+            try:
+                self.chunk_db.add_chunk(stored_chunk)
+                # Incrémenter le compteur de chunks étrangers
+                self.chunk_db.increment_foreign_chunks_counter(1)
+                
+                # Appeler le callback si disponible pour mettre à jour l'UI
+                if self.on_chunk_stored:
+                    try:
+                        self.on_chunk_stored()
+                    except Exception as e:
+                        self.logger.warning(f"Erreur appel callback on_chunk_stored: {e}")
+            except Exception as e:
+                self.logger.warning(f"Erreur enregistrement chunk en DB: {e}")
         
         self.logger.info(
             f"Chunk stocké: {file_uuid}/{chunk_idx} "
@@ -505,9 +550,10 @@ class ChunkNetworkServer:
         owner_uuid = params['owner_uuid']
         
         # Récupérer le chunk
+        # La signature de get_chunk est: (owner_uuid, file_uuid, chunk_idx)
         chunk_data = await asyncio.to_thread(
             self.chunk_store.get_chunk,
-            file_uuid, chunk_idx, owner_uuid
+            owner_uuid, file_uuid, chunk_idx
         )
         
         if chunk_data is None:
@@ -546,18 +592,20 @@ class ChunkNetworkServer:
         owner_uuid = params['owner_uuid']
         
         # Vérifier que le chunk existe
+        # La signature est: (owner_uuid, file_uuid, chunk_idx)
         chunk_data = await asyncio.to_thread(
             self.chunk_store.get_chunk,
-            file_uuid, chunk_idx, owner_uuid
+            owner_uuid, file_uuid, chunk_idx
         )
-        
+
         if chunk_data is None:
             return {'success': True, 'deleted': False, 'reason': 'not_found'}
-        
+
         # Supprimer
+        # La signature est: (owner_uuid, file_uuid, chunk_idx)
         await asyncio.to_thread(
             self.chunk_store.delete_chunk,
-            file_uuid, chunk_idx, owner_uuid
+            owner_uuid, file_uuid, chunk_idx
         )
         
         self.logger.info(f"Chunk supprimé: {file_uuid}/{chunk_idx}")
@@ -587,22 +635,32 @@ class ChunkNetworkServer:
         file_uuid = params['file_uuid']
         chunk_idx = params['chunk_idx']
         owner_uuid = params['owner_uuid']
-        
-        # Récupérer les métadonnées
-        metadata = await asyncio.to_thread(
-            self.chunk_store.get_metadata,
-            file_uuid, chunk_idx, owner_uuid
+
+        # Vérifier si le chunk existe sur disque
+        chunk_exists = await asyncio.to_thread(
+            self.chunk_store.chunk_exists,
+            owner_uuid, file_uuid, chunk_idx
         )
-        
-        if metadata is None:
+
+        if not chunk_exists:
             return {'exists': False}
-        
+
+        # Récupérer la taille du chunk
+        chunk_size = await asyncio.to_thread(
+            self.chunk_store.get_chunk_size,
+            owner_uuid, file_uuid, chunk_idx
+        )
+
+        # Calculer le hash du chunk
+        chunk_hash = await asyncio.to_thread(
+            self.chunk_store.get_chunk_hash,
+            owner_uuid, file_uuid, chunk_idx
+        )
+
         return {
             'exists': True,
-            'content_hash': metadata.get('content_hash'),
-            'size_bytes': metadata.get('size_bytes', 0),
-            'stored_at': metadata.get('stored_at'),
-            'expires_at': metadata.get('expires_at'),
+            'content_hash': chunk_hash,
+            'size_bytes': chunk_size,
         }
     
     async def _handle_list_chunks(self, params: Dict[str, Any]) -> Dict[str, Any]:

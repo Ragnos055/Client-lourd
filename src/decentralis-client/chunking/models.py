@@ -78,6 +78,7 @@ class ChunkMetadata:
         file_uuid: Identifiant unique du fichier chunké
         owner_uuid: UUID du propriétaire du fichier
         original_filename: Nom original du fichier
+        file_path: Chemin complet du fichier (dossier/sub/fichier.txt)
         original_hash: Hash SHA-256 du fichier original
         original_size: Taille originale en bytes
         total_chunks: Nombre total de chunks (data + parité)
@@ -96,6 +97,7 @@ class ChunkMetadata:
         ...     file_uuid="abc-123",
         ...     owner_uuid="user-456",
         ...     original_filename="test.dat",
+        ...     file_path="dossier/test.dat",
         ...     original_hash="sha256...",
         ...     original_size=1048576,
         ...     total_chunks=10,
@@ -109,6 +111,7 @@ class ChunkMetadata:
     file_uuid: str
     owner_uuid: str
     original_filename: str = ""
+    file_path: str = ""
     original_hash: str = ""
     original_size: int = 0
     total_chunks: int = 0
@@ -138,6 +141,7 @@ class ChunkMetadata:
             'file_uuid': self.file_uuid,
             'owner_uuid': self.owner_uuid,
             'original_filename': self.original_filename,
+            'file_path': self.file_path,
             'original_hash': self.original_hash,
             'original_size': self.original_size,
             'total_chunks': self.total_chunks,
@@ -196,6 +200,7 @@ class ChunkMetadata:
             file_uuid=data['file_uuid'],
             owner_uuid=data['owner_uuid'],
             original_filename=data.get('original_filename', ''),
+            file_path=data.get('file_path', ''),
             original_hash=data.get('original_hash', ''),
             original_size=data.get('original_size', 0),
             total_chunks=data.get('total_chunks', 0),
@@ -401,6 +406,7 @@ class ChunkAssignment:
             'status': self.status,
             'attempts': self.attempts,
             'failure_reason': self.failure_reason,
+            'error_message': self.failure_reason,  # Alias pour la GUI
         }
     
     @classmethod
