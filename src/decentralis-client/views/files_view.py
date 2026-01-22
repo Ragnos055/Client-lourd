@@ -1089,7 +1089,12 @@ class FilesView(ttk.Frame):
                     percent = int((idx - 1) / total_files * 100)
                     self._update_progress(logical_path, 'Rebuild', percent)
                     self.after(0, lambda p=logical_path: print(f"[Rebuild] Début: {p}"))
-                    await chunking_mgr.reconstruct_file(file_uuid, None, None)
+                    container_path = self.get_container_path(file_uuid)
+                    await chunking_mgr.reconstruct_file(
+                        file_uuid=file_uuid,
+                        owner_uuid=None,
+                        output_path=container_path
+                    )
                     success_count += 1
                     self._update_progress(logical_path, 'Rebuild', 100)
                     self.after(0, lambda p=logical_path: print(f"[Rebuild] Succès: {p}"))
