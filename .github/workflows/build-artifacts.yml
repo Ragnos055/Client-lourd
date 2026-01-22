@@ -6,6 +6,60 @@ on:
   workflow_dispatch:
 
 jobs:
+  build-macos:
+    name: Build macOS App
+    runs-on: macos-latest
+    env:
+      NAME: decentralis-client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          # Check for .icns icon, fallback to .png
+          ICON_OPT=""
+          if [ -f "assets/icon.icns" ]; then
+            ICON_OPT="--icon=assets/icon.icns"
+          elif [ -f "assets/icon.png" ]; then
+            ICON_OPT="--icon=assets/icon.png"
+          fi
+          pyinstaller --onefile --windowed --name ${NAME} ${ICON_OPT} src/decentralis-client/main.py
+
+      - name: Create DMG
+        run: |
+          # Create a DMG from the .app bundle
+          if [ -d "dist/${NAME}.app" ]; then
+            hdiutil create -volname "${NAME}" -srcfolder "dist/${NAME}.app" -ov -format UDZO "dist/${NAME}.dmg"
+          fi
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: decentralis-client-macos
+          path: |
+            dist/decentralis-client
+            dist/decentralis-client.app
+            dist/decentralis-client.dmg
+
   build-windows:
     name: Build Windows .exe
     runs-on: windows-latest
@@ -136,11 +190,17 @@ jobs:
   publish-release:
     name: Publish Release Assets
     runs-on: ubuntu-latest
-    needs: [build-windows, build-linux]
+    needs: [build-macos, build-windows, build-linux]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: decentralis-client-macos
+          path: artifacts/macos
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
@@ -156,6 +216,8 @@ jobs:
 
       - name: List downloaded files
         run: |
+          echo "Files in artifacts/macos:"
+          ls -R artifacts/macos || true
           echo "Files in artifacts/windows:"
           ls -R artifacts/windows || true
           echo "Files in artifacts/linux:"
