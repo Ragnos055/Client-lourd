@@ -23,8 +23,8 @@ if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 if (Test-Path "$Name.spec") { Remove-Item -Force "$Name.spec" }
 
-Write-Host "Running PyInstaller..."
-pyinstaller --onefile --name $Name --icon .\assets\icon.ico --distpath $OutDir $Entry
+Write-Host "Running PyInstaller (no console window)..."
+pyinstaller --onefile --noconsole --name $Name --icon .\assets\icon.ico --distpath $OutDir $Entry
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build réussi. Fichier généré dans: $OutDir\$Name.exe"
