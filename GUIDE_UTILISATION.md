@@ -1,6 +1,5 @@
 # Guide d’utilisation — Decentralis Client
 
-
 ## Prérequis
 
 - Python 3.8+ (3.11 recommandé)
@@ -33,6 +32,8 @@ Optionnel : pour la génération d’exécutables, PyInstaller est utilisé par 
 
 ## Connexion au tracker
 
+![connexion](image/GUIDE_UTILISATION/connexion.png)
+
 1. Dans l’en‑tête de l’application, renseignez l’IP et le port du tracker.
 2. Renseignez également votre IP/port local (utilisés pour la communication P2P).
 3. Cliquez sur « Connexion ».
@@ -45,9 +46,13 @@ La liste des pairs se met à jour automatiquement dans la vue Pairs.
 
 ### Vue Pairs
 
+![peerview](image/GUIDE_UTILISATION/peerview.png)
+
 - Affiche les pairs connus (liste rafraîchie périodiquement).
 
 ### Vue Gestionnaire de fichiers
+
+![fileview](image/GUIDE_UTILISATION/fileview.png)
 
 Fonctions principales :
 
@@ -58,6 +63,8 @@ Fonctions principales :
 - suppression (avec confirmation).
 
 ### Vue P2P
+
+![chunkingview](image/GUIDE_UTILISATION/chunkingview.png)
 
 Fonctions principales :
 
@@ -70,6 +77,8 @@ Indicateurs réseau : nombre de peers, état serveur P2P, nombre de chunks stock
 
 ### Vue Chiffrement
 
+![encryptview](image/GUIDE_UTILISATION/encryptview.png)
+
 - Choix d’algorithme (ex : AES‑256)
 - Génération d’une clé hexadécimale
 
@@ -79,10 +88,11 @@ Indicateurs réseau : nombre de peers, état serveur P2P, nombre de chunks stock
 
 1. **Connectez‑vous au tracker**.
 2. **Uploader un fichier** dans la vue gestionnaire de fichier.
-4. **Distribuer et chunker** le fichier est automatiquement découpé et distribuer vers les peers.
-5. **Rebuild** Si vous souhaitez consulter un fichier qui a était mis dans le réseau, cliquer sur rebuild, laisser faire le logiciel, puis ouvrez votre ficheir avec ouvrir.
+3. **Distribuer et chunker** le fichier est automatiquement découpé et distribuer vers les peers.
+4. **Rebuild** Si vous souhaitez consulter un fichier qui a était mis dans le réseau, cliquer sur rebuild, laisser faire le logiciel, puis ouvrez votre ficheir avec ouvrir.
 
 Notes utiles :
+
 - La distribution supprime les chunks locaux après confirmation par les peers.
 - La reconstruction nécessite au minimum le nombre de chunks de données requis par Reed‑Solomon.
 
@@ -96,4 +106,5 @@ Notes utiles :
 Un exécutable Windows peut être lancé en mode debug via [run_exe_debug.bat](run_exe_debug.bat).
 
 ---
+
  Bonne utilisation !
